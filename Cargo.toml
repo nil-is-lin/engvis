@@ -1,0 +1,44 @@
+[package]
+name = "engvis"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+engvis-core = { path = "crates/engvis-core" }
+engvis-renderer = { path = "crates/engvis-renderer" }
+wgpu.workspace = true
+winit.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+pollster.workspace = true
+log.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/engvis-core",
+    "crates/engvis-renderer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["nil"]
+license = "MIT"
+
+[workspace.dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+glam = { version = "0.30", features = ["bytemuck"] }
+wgpu = "27.0"
+winit = "0.30"
+egui = "0.33"
+egui-wgpu = "0.33"
+egui-winit = "0.33"
+pollster = "0.4"
+log = "0.4"
+env_logger = "0.11"
+gltf = "1.4"
+image = "0.25"

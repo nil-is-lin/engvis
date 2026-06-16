@@ -1,0 +1,9 @@
+[package]
+name = "engvis-core"
+version.workspace = true
+edition.workspace = true
+description = "Core data types for engineering visualization"
+
+[dependencies]
+glam.workspace = true
+bytemuck.workspace = true
