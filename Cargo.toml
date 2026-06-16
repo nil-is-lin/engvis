@@ -3,6 +3,10 @@ name = "engvis"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
+description = "Engineering visualization framework with GPU rendering"
+repository = "https://github.com/yourusername/engvis"
+readme = "README.md"
 
 [dependencies]
 engvis-core = { path = "crates/engvis-core" }
