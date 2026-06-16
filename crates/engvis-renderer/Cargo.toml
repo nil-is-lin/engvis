@@ -7,7 +7,7 @@ license.workspace = true
 description = "GPU rendering for engineering visualization"
 
 [dependencies]
-engvis-core = { path = "../engvis-core" }
+engvis-core = "0.1.0"
 glam.workspace = true
 bytemuck.workspace = true
 wgpu.workspace = true
