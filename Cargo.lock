@@ -773,8 +773,8 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "egui-wgpu",
- "engvis-core",
- "engvis-renderer",
+ "engvis-core 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "engvis-renderer 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "env_logger",
  "glam",
  "log",
@@ -792,6 +792,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "engvis-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60eac4407be9efd3d4d748fc928548e09210efe6e68e39a7a4e2fd7f07a4121d"
+dependencies = [
+ "bytemuck",
+ "glam",
+]
+
+[[package]]
 name = "engvis-renderer"
 version = "0.1.0"
 dependencies = [
@@ -799,7 +809,27 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
- "engvis-core",
+ "engvis-core 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "glam",
+ "gltf",
+ "image",
+ "log",
+ "pollster",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "engvis-renderer"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3c73a0156fd2b92e11663c01eb1b049f26bbb8b8f6cae88d3e4c1fe2b72913b"
+dependencies = [
+ "bytemuck",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "engvis-core 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "glam",
  "gltf",
  "image",
