@@ -103,21 +103,27 @@ engvis-core = "0.1.0"
 engvis-renderer = "0.1.0"
 ```
 
-### 示例代码
+### ⚠️ 重要注意事项
+
+#### 关键步骤：上传场景数据到GPU
+
+在使用engvis库时，**必须**在创建渲染器后调用`upload_scene`方法将场景数据上传到GPU。如果缺少这一步，渲染管线会因为缺少必要的BindGroup而报错：
+
+```
+wgpu error: Validation Error
+Caused by:
+  In a CommandEncoder
+    In a draw command, kind: Draw
+      The current set RenderPipeline with 'PBR Solid Pipeline' label expects a BindGroup to be set at index 2
+```
+
+**正确的初始化流程：**
 
 ```rust
-use engvis_core::{OrbitCamera, Scene, SceneNode, Mesh, PbrMaterial};
-use engvis_renderer::{Renderer, create_window_and_gpu};
-use glam::{Vec3, Affine3A};
-
-// 创建场景
+// 1. 创建场景
 let mut scene = Scene::default();
-
-// 添加网格和材质
 scene.meshes.push(your_mesh);
 scene.materials.push(PbrMaterial::default());
-
-// 添加场景节点
 scene.nodes.push(SceneNode {
     name: "MyObject".to_string(),
     local_transform: Affine3A::IDENTITY,
@@ -126,11 +132,157 @@ scene.nodes.push(SceneNode {
     visible: true,
 });
 
+// 2. 创建渲染器
+let mut renderer = Renderer::new(
+    &gpu.context.device,
+    &gpu.context.queue,
+    gpu.surface_format,
+    &scene,
+    size.width,
+    size.height,
+);
+
+// 3. 上传场景数据到GPU（关键步骤！）
+renderer.upload_scene(&gpu.context.device, &gpu.context.queue, &scene);
+```
+
+#### 为什么需要upload_scene？
+
+`upload_scene`方法会：
+- 将网格数据（顶点、索引）上传到GPU缓冲区
+- 创建材质纹理和BindGroup
+- 设置光照系统的GPU资源
+- 准备渲染管线所需的所有资源
+
+没有这一步，渲染器无法访问场景数据，导致渲染失败。
+
+### 示例代码
+
+```rust
+use engvis_core::{OrbitCamera, Scene, SceneNode, PbrMaterial, mesh::create_cube_mesh};
+use engvis_renderer::{Renderer, create_window_and_gpu};
+use glam::{Vec3, Affine3A};
+
+// 创建场景
+let mut scene = Scene::default();
+
+// 使用内置函数创建网格（推荐）
+let cube = create_cube_mesh();
+
+// 添加网格和材质
+scene.meshes.push(cube);
+scene.materials.push(PbrMaterial {
+    name: "Default".to_string(),
+    albedo: [0.7, 0.4, 0.3, 1.0],
+    metallic: 0.1,
+    roughness: 0.6,
+    ..Default::default()
+});
+
+// 添加场景节点
+scene.nodes.push(SceneNode {
+    name: "MyObject".to_string(),
+    local_transform: Affine3A::from_translation(Vec3::new(0.0, 0.5, 0.0)),
+    mesh_index: Some(0),
+    children: Vec::new(),
+    visible: true,
+});
+
 // 创建相机
 let camera = OrbitCamera::new(Vec3::ZERO, 5.0);
 
-// 渲染
-// ... 参考examples目录中的完整示例
+// 创建窗口和GPU上下文
+let (window, gpu) = create_window_and_gpu(event_loop, "My App", 800, 600).await;
+
+// 创建渲染器
+let mut renderer = Renderer::new(
+    &gpu.context.device,
+    &gpu.context.queue,
+    gpu.surface_format,
+    &scene,
+    size.width,
+    size.height,
+);
+
+// 上传场景数据到GPU（关键步骤！）
+renderer.upload_scene(&gpu.context.device, &gpu.context.queue, &scene);
+
+// 渲染循环中...
+renderer.render_scene_pass(&device, &queue, view, encoder, &scene, &camera);
+```
+
+### 手动创建网格
+
+如果需要手动创建网格，必须提供完整的顶点数据（包括切线）：
+
+```rust
+use engvis_core::{Mesh, MeshVertex, SubMesh, Aabb};
+
+let vertices = vec![
+    MeshVertex {
+        position: [-0.5, -0.5, 0.5],
+        normal: [0.0, 0.0, 1.0],
+        uv: [0.0, 0.0],
+        tangent: [1.0, 0.0, 0.0, 1.0],  // 切线是必需的！
+    },
+    // ... 更多顶点
+];
+
+let indices = vec![
+    0, 1, 2, 0, 2, 3,  // 每个面2个三角形
+    // ... 更多索引
+];
+
+let mesh = Mesh {
+    name: "MyMesh".to_string(),
+    vertices,
+    indices,
+    sub_meshes: vec![SubMesh {
+        material_index: 0,
+        index_offset: 0,
+        index_count: indices.len() as u32,
+    }],
+    aabb: Aabb {
+        min: Vec3::new(-0.5, -0.5, -0.5),
+        max: Vec3::new(0.5, 0.5, 0.5),
+    },
+};
+```
+
+### 加载glTF模型
+
+```rust
+use engvis_renderer::load_gltf;
+
+let scene = load_gltf(
+    "path/to/model.gltf",
+    &gpu.context.device,
+    &gpu.context.queue,
+    &mut renderer.texture_cache,
+)?;
+
+renderer.upload_scene(&gpu.context.device, &gpu.context.queue, &scene);
+```
+
+### 自定义光照
+
+```rust
+use engvis_core::{AmbientLight, DirectionalLight, LightingEnvironment};
+
+scene.lighting = LightingEnvironment {
+    ambient: AmbientLight {
+        color: [0.3, 0.3, 0.3],
+        intensity: 0.5,
+    },
+    directional_lights: vec![
+        DirectionalLight {
+            direction: Vec3::new(1.0, -1.0, 0.5).normalize(),
+            color: [1.0, 1.0, 1.0],
+            intensity: 1.0,
+        },
+    ],
+    point_lights: Vec::new(),
+};
 ```
 
 ## 技术栈
