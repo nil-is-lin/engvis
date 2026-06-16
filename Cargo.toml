@@ -9,8 +9,8 @@ repository = "https://github.com/yourusername/engvis"
 readme = "README.md"
 
 [dependencies]
-engvis-core = { path = "crates/engvis-core" }
-engvis-renderer = { path = "crates/engvis-renderer" }
+engvis-core = "0.1.0"
+engvis-renderer = "0.1.0"
 wgpu.workspace = true
 winit.workspace = true
 egui.workspace = true
