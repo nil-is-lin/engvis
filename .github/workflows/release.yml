@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
@@ -14,7 +17,7 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -29,6 +32,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -39,16 +46,16 @@ jobs:
       - name: Package
         shell: bash
         run: |
+          mkdir -p artifacts
           cd target/${{ matrix.target }}/release
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a ../../../engvis-${{ matrix.target }}.zip engvis.exe
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a ../../../artifacts/engvis-${{ matrix.target }}.zip engvis.exe
           else
-            tar czf ../../../engvis-${{ matrix.target }}.tar.gz engvis
+            tar czf ../../../artifacts/engvis-${{ matrix.target }}.tar.gz engvis
           fi
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: engvis-${{ matrix.target }}.*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
