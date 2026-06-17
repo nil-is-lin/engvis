@@ -1,4 +1,5 @@
 use glam::{Mat4, Vec3};
+use crate::scene::Scene;
 use crate::aabb::Aabb;
 
 #[derive(Debug, Clone)]
@@ -32,6 +33,17 @@ impl OrbitCamera {
             near: 0.01,
             far: 1000.0,
             aspect_ratio: 16.0 / 9.0,
+        }
+    }
+
+    /// Target + distance variant (no pitch/yaw offset).
+    pub fn looking_at(target: Vec3, distance: f32) -> Self {
+        Self {
+            target,
+            yaw: 0.0,
+            pitch: 0.0,
+            distance,
+            ..Default::default()
         }
     }
 
@@ -96,14 +108,22 @@ impl OrbitCamera {
         self.distance = self.distance.clamp(0.1, 500.0);
     }
 
-    /// Fit camera to show a bounding box
+    /// Fit camera to show a bounding box, adjusting near/far automatically.
     pub fn fit_to_aabb(&mut self, aabb: Aabb) {
         if !aabb.is_valid() {
             return;
         }
         self.target = aabb.center();
         let radius = aabb.diagonal() * 0.5;
-        self.distance = (radius / (self.fov_y * 0.5).sin()).max(0.5);
+        let min_dist = (radius / (self.fov_y * 0.5).sin()).max(0.5);
+        self.distance = min_dist * 1.4; // +40% margin
+        self.near = (min_dist - radius * 2.0).max(0.01);
+        self.far = (min_dist + radius * 4.0).max(10.0);
+    }
+
+    /// Fit camera to show an entire scene.
+    pub fn fit_to_scene(&mut self, scene: &Scene) {
+        self.fit_to_aabb(scene.compute_aabb());
     }
 
     /// Preset: front view

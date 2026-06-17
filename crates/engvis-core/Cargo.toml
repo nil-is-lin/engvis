@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Core data types for engineering visualization"
+keywords = ["3d", "visualization", "wgpu", "pbr", "engineering"]
+categories = ["graphics", "rendering"]
+homepage = "https://github.com/nil-is-lin/engvis"
+repository = "https://github.com/nil-is-lin/engvis"
 
 [dependencies]
 glam.workspace = true

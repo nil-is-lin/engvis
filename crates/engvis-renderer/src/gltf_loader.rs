@@ -17,7 +17,6 @@ fn gltf_image_to_rgba(img: &gltf::image::Data) -> image::RgbaImage {
                 .unwrap_or_else(|| image::RgbaImage::new(width, height))
         }
         gltf::image::Format::R8G8B8 => {
-            // Convert RGB to RGBA
             let mut rgba = Vec::with_capacity(pixels.len() / 3 * 4);
             for chunk in pixels.chunks(3) {
                 if chunk.len() == 3 {
@@ -28,13 +27,13 @@ fn gltf_image_to_rgba(img: &gltf::image::Data) -> image::RgbaImage {
                 .unwrap_or_else(|| image::RgbaImage::new(width, height))
         }
         _ => {
-            // For other formats, try raw RGBA or fall back to empty
             image::RgbaImage::from_raw(width, height, pixels.clone())
                 .unwrap_or_else(|| image::RgbaImage::new(width, height))
         }
     }
 }
 
+#[derive(Debug)]
 pub enum GltfLoadError {
     Io(std::io::Error),
     Gltf(gltf::Error),
@@ -69,12 +68,17 @@ impl std::fmt::Display for GltfLoadError {
     }
 }
 
+impl std::error::Error for GltfLoadError {}
+
+/// Load a glTF file into a `(Scene, Aabb)` pair.
+/// The returned Aabb is the scene's world-space bounding box, computed from
+/// the node hierarchy (not the local AABB of each mesh).
 pub fn load_gltf(
     path: &str,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture_cache: &mut TextureCache,
-) -> Result<Scene, GltfLoadError> {
+) -> Result<(Scene, Aabb), GltfLoadError> {
     let (gltf, buffers, images) = gltf::import(path)?;
 
     let mut meshes = Vec::new();
@@ -205,15 +209,15 @@ pub fn load_gltf(
                 engvis_core::math::compute_tangents(&positions, &normals, &uvs, &prim_indices)
             };
 
-            let base_vertex = vertices.len() as u32;
-            for i in 0..positions.len() {
-                vertices.push(MeshVertex {
-                    position: positions[i],
-                    normal: normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
-                    uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
-                    tangent: tangents.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 1.0]),
-                });
-                aabb.expand(Vec3::from(positions[i]));
+           let base_vertex = vertices.len() as u32;
+           for (i, &pos) in positions.iter().enumerate() {
+               vertices.push(MeshVertex {
+                   position: pos,
+                   normal: normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
+                   uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                   tangent: tangents.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 1.0]),
+               });
+               aabb.expand(Vec3::from(pos));
             }
 
             let index_offset = indices.len() as u32;
@@ -268,5 +272,7 @@ pub fn load_gltf(
         lighting: LightingEnvironment::default(),
     };
 
-    Ok(scene)
+    let aabb = scene.compute_aabb();
+
+    Ok((scene, aabb))
 }

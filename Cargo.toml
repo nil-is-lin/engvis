@@ -5,12 +5,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Engineering visualization framework with GPU rendering"
-repository = "https://github.com/yourusername/engvis"
+repository = "https://github.com/nil-is-lin/engvis"
 readme = "README.md"
 
 [dependencies]
-engvis-core = "0.1.0"
-engvis-renderer = "0.1.0"
+engvis-core = { path = "crates/engvis-core" }
+engvis-renderer = { path = "crates/engvis-renderer" }
 wgpu.workspace = true
 winit.workspace = true
 egui.workspace = true
@@ -25,6 +25,7 @@ resolver = "2"
 members = [
     "crates/engvis-core",
     "crates/engvis-renderer",
+    "fidget-demo",
 ]
 
 [workspace.package]
@@ -46,3 +47,5 @@ log = "0.4"
 env_logger = "0.11"
 gltf = "1.4"
 image = "0.25"
+fidget-core = "0.4.3"
+fidget-mesh = "0.4.3"

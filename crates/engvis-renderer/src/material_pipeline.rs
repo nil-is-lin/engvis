@@ -26,6 +26,7 @@ impl MaterialPipeline {
         scene_layout: &wgpu::BindGroupLayout,
         lighting_layout: &wgpu::BindGroupLayout,
         object_layout: &wgpu::BindGroupLayout,
+        sample_count: u32,
     ) -> Self {
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -137,10 +138,10 @@ impl MaterialPipeline {
             label: Some("PBR Solid Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader_module,
-                entry_point: Some("vs_main"),
-                buffers: &[vertex_layout.clone()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+               module: &shader_module,
+               entry_point: Some("vs_main"),
+               buffers: std::slice::from_ref(&vertex_layout),
+               compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader_module,
@@ -169,7 +170,7 @@ impl MaterialPipeline {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: 4,
+                count: sample_count,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },

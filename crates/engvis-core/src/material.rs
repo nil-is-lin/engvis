@@ -69,3 +69,38 @@ impl Default for EdgeRenderOptions {
         }
     }
 }
+
+// ── RenderState ──────────────────────────────────────────────
+
+/// Aggregated rendering state that can be applied atomically.
+///
+/// Use `FrameCtx::set_render_state()` to update all rendering options in one call,
+/// or modulate individual fields directly via `frame.render_state.field`.
+///
+/// Clipping planes (near/far) are not part of this struct; use
+/// `FrameCtx::set_clip_planes()` to set them explicitly.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderState {
+    /// Whether to render the surface (solid PBR mesh).
+    pub show_surface: bool,
+    /// Whether to render the ground/axis grid.
+    pub show_grid: bool,
+    /// Global surface opacity (0.0 = fully transparent, 1.0 = fully opaque).
+    pub opacity: f32,
+    /// Vertex (point) overlay options.
+    pub vertex_opts: VertexRenderOptions,
+    /// Edge (wireframe) overlay options.
+    pub edge_opts: EdgeRenderOptions,
+}
+
+impl Default for RenderState {
+    fn default() -> Self {
+        Self {
+            show_surface: true,
+            show_grid: true,
+            opacity: 1.0,
+            vertex_opts: VertexRenderOptions::default(),
+            edge_opts: EdgeRenderOptions::default(),
+        }
+    }
+}

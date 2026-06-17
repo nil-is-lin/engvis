@@ -303,4 +303,4 @@ scene.lighting = LightingEnvironment {
 
 ## 作者
 
-nil (nil_lilin@163.com)
+nil

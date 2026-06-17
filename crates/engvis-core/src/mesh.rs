@@ -45,6 +45,58 @@ impl Mesh {
         }
         edge_indices
     }
+
+    /// Create a smooth-shaded mesh from flat position and index arrays.
+    ///
+    /// Computes smooth vertex normals (area-weighted), zero UVs and a default tangent.
+    pub fn from_triangles(
+        name: impl Into<String>,
+        positions: &[[f32; 3]],
+        indices: &[u32],
+    ) -> Self {
+        let n_verts = positions.len();
+        let mut smooth_normals = vec![[0.0_f32; 3]; n_verts];
+
+        for tri in indices.chunks_exact(3) {
+            let i0 = tri[0] as usize;
+            let i1 = tri[1] as usize;
+            let i2 = tri[2] as usize;
+            let p0 = glam::Vec3::from(positions[i0]);
+            let p1 = glam::Vec3::from(positions[i1]);
+            let p2 = glam::Vec3::from(positions[i2]);
+            let n = (p1 - p0).cross(p2 - p0);
+            for &i in &[i0, i1, i2] {
+                smooth_normals[i][0] += n.x;
+                smooth_normals[i][1] += n.y;
+                smooth_normals[i][2] += n.z;
+            }
+        }
+        for n in &mut smooth_normals {
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if len > 1e-10 {
+                let inv = 1.0 / len;
+                n[0] *= inv; n[1] *= inv; n[2] *= inv;
+            } else { *n = [0.0, 1.0, 0.0]; }
+        }
+
+        let vertices: Vec<MeshVertex> = positions.iter().zip(smooth_normals.iter())
+            .map(|(pos, norm)| MeshVertex {
+                position: *pos, normal: *norm,
+                uv: [0.0, 0.0], tangent: [1.0, 0.0, 0.0, 1.0],
+            }).collect();
+
+        let mut aabb = crate::Aabb::empty();
+        for p in positions { aabb.expand(glam::Vec3::from(*p)); }
+
+        let index_count = indices.len() as u32;
+        Mesh {
+            name: name.into(),
+            vertices,
+            indices: indices.to_vec(),
+            sub_meshes: vec![SubMesh { material_index: 0, index_offset: 0, index_count }],
+            aabb,
+        }
+    }
 }
 
 /// Create a unit cube mesh with normals, UVs, and tangents
@@ -123,7 +175,7 @@ pub fn create_cube_mesh() -> Mesh {
                 uv: *uv,
                 tangent: *tangent,
             });
-            aabb.extend_pos(*pos);
+            aabb.expand(glam::Vec3::from(*pos));
         }
         indices.extend_from_slice(&[
             base, base + 2, base + 1,
@@ -142,13 +194,5 @@ pub fn create_cube_mesh() -> Mesh {
             index_count,
         }],
         aabb,
-    }
-}
-
-impl Aabb {
-    fn extend_pos(&mut self, pos: [f32; 3]) {
-        let v = glam::Vec3::from(pos);
-        self.min = self.min.min(v);
-        self.max = self.max.max(v);
     }
 }

@@ -5,9 +5,13 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "GPU rendering for engineering visualization"
+keywords = ["3d", "visualization", "wgpu", "pbr", "engineering"]
+categories = ["graphics", "rendering"]
+homepage = "https://github.com/nil-is-lin/engvis"
+repository = "https://github.com/nil-is-lin/engvis"
 
 [dependencies]
-engvis-core = "0.1.0"
+engvis-core = { path = "../engvis-core" }
 glam.workspace = true
 bytemuck.workspace = true
 wgpu.workspace = true

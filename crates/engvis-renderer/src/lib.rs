@@ -1,3 +1,5 @@
+#![doc = "GPU rendering for engineering visualization.\n\nBuilds on `engvis-core` to provide wgpu-based rendering pipelines, egui integration, and glTF loading."]
+
 pub mod gpu;
 pub mod depth;
 pub mod egui_integration;
@@ -10,6 +12,8 @@ pub mod overlay_renderer;
 pub mod lighting;
 pub mod gltf_loader;
 pub mod texture_cache;
+pub mod custom_material;
+pub mod app;
 
 pub use gpu::{GpuContext, GpuResources, create_window_and_gpu};
 pub use depth::DepthTexture;
@@ -23,3 +27,5 @@ pub use overlay_renderer::OverlayRenderer;
 pub use lighting::LightingBuffer;
 pub use texture_cache::TextureCache;
 pub use gltf_loader::load_gltf;
+pub use custom_material::{CustomMaterial, BasicMaterial};
+pub use app::{EngvisApp, AppCtx, FrameCtx, RunConfig, EventHandling, run};

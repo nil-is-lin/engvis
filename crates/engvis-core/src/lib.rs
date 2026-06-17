@@ -1,3 +1,5 @@
+#![doc = "Core data types for engineering visualization.\n\nProvides `Scene`, `Mesh`, `PbrMaterial`, `OrbitCamera`, and lighting types."]
+
 pub mod math;
 pub mod aabb;
 pub mod camera;
@@ -11,6 +13,6 @@ pub use camera::OrbitCamera;
 pub use input::{InputState, ViewportRect};
 pub use scene::{Scene, SceneNode};
 pub use mesh::{Mesh, MeshVertex, SubMesh};
-pub use material::{PbrMaterial, VertexRenderOptions, EdgeRenderOptions};
+pub use material::{PbrMaterial, VertexRenderOptions, EdgeRenderOptions, RenderState};
 pub use light::{AmbientLight, DirectionalLight, PointLight, LightingEnvironment};
 pub use aabb::Aabb;

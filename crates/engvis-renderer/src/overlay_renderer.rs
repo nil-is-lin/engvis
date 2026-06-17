@@ -27,6 +27,7 @@ impl OverlayRenderer {
         depth_format: wgpu::TextureFormat,
         scene_layout: &wgpu::BindGroupLayout,
         object_layout: &wgpu::BindGroupLayout,
+        sample_count: u32,
     ) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Overlay Shader"),
@@ -186,7 +187,7 @@ impl OverlayRenderer {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: 4,
+                count: sample_count,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -231,7 +232,7 @@ impl OverlayRenderer {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: 4,
+                count: sample_count,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
