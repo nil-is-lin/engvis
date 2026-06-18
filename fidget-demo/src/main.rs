@@ -13,7 +13,7 @@ use engvis_renderer::{
 };
 
 // ── Surface builder ─────────────────────────────────────────
-fn build_fidget_mesh(name: &str, depth: u8) -> (Vec<[f32; 3]>, Vec<u32>) {
+fn build_fidget_mesh(name: &str, depth: u8) -> Mesh {
     use fidget_core::context::Tree as T;
     use fidget_core::shape::Shape;
     use fidget_core::vm::VmFunction;
@@ -49,7 +49,7 @@ fn build_fidget_mesh(name: &str, depth: u8) -> (Vec<[f32; 3]>, Vec<u32>) {
     let pos: Vec<[f32;3]> = m.vertices.iter().map(|v| [v.x, v.y, v.z]).collect();
     let idx: Vec<u32> = m.triangles.iter().flat_map(|t| [t.x as u32, t.y as u32, t.z as u32]).collect();
     eprintln!("  {} verts, {} tris (depth={})", pos.len(), idx.len()/3, depth);
-    (pos, idx)
+    Mesh::from_triangles(name, &pos, &idx)
 }
 
 // ── App ──────────────────────────────────────────────────────
@@ -58,6 +58,7 @@ struct App {
     surf_name: String,
     surf_depth: u8,
     needs_remesh: bool,
+    topo: Option<engvis_core::MeshTopology>,
     albedo:   [f32; 3],
     metallic: f32,
     roughness: f32,
@@ -72,14 +73,14 @@ impl EngvisApp for App {
             title: "Fidget Viewer".into(),
             width: 1200,
             height: 800,
-            sample_count: 1,
+            sample_count: 4,
             ..Default::default()
         }
     }
 
     fn on_setup(&mut self, _ctx: &mut AppCtx) -> Scene {
-        let (pos, idx) = build_fidget_mesh(&self.surf_name, self.surf_depth);
-        let mesh = Mesh::from_triangles(self.surf_name.as_str(), &pos, &idx);
+        let mesh = build_fidget_mesh(&self.surf_name, self.surf_depth);
+        self.topo = Some(engvis_core::compute_topology(&mesh));
         let material = PbrMaterial {
             name: "Surface".into(),
             albedo: [self.albedo[0], self.albedo[1], self.albedo[2], 1.0],
@@ -102,6 +103,7 @@ impl EngvisApp for App {
         let surf_name = &mut self.surf_name;
         let surf_depth = &mut self.surf_depth;
         let needs_remesh = &mut self.needs_remesh;
+        let topo = &mut self.topo;
         let albedo = &mut self.albedo;
         let metallic = &mut self.metallic;
         let roughness = &mut self.roughness;
@@ -176,22 +178,43 @@ impl EngvisApp for App {
 
                 ui.separator();
                 ui.checkbox(&mut rs.show_grid, "Grid");
-
-                ui.separator();
-                ui.add_space(4.0);
-                ui.colored_label(egui::Color32::GRAY,
-                    format!("Tris: {}", scene.meshes.first().map(|m| m.indices.len()/3).unwrap_or(0)));
-                ui.colored_label(egui::Color32::GRAY,
-                    format!("Verts: {}", scene.meshes.first().map(|m| m.vertices.len()).unwrap_or(0)));
-                ui.colored_label(egui::Color32::GRAY,
-                    format!("FPS: {fps:.0}"));
             });
+
+        // ── Bottom status bar ──
+        egui::TopBottomPanel::bottom("status_bar").show(egui_ctx, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(t) = topo {
+                    let chi_color = if t.is_watertight {
+                        egui::Color32::from_rgb(100, 220, 100)
+                    } else {
+                        egui::Color32::from_rgb(220, 160, 60)
+                    };
+                    ui.label(format!("V: {}  E: {}  F: {}", t.vertices, t.edges, t.faces));
+                    ui.separator();
+                    ui.colored_label(chi_color, format!("χ={}", t.euler));
+                    ui.separator();
+                    ui.label(format!("boundary: {}", t.boundary_edges));
+                    ui.separator();
+                    ui.label(format!("non-manifold: {}", t.non_manifold_edges));
+                    ui.separator();
+                    ui.label(format!("components: {}", t.connected_components));
+                    ui.separator();
+                    ui.colored_label(
+                        chi_color,
+                        if t.is_watertight { "watertight" } else { "open" },
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!("FPS: {fps:.0}"));
+                });
+            });
+        });
 
         // ── Remesh / material update ──
         if *needs_remesh {
             *needs_remesh = false;
-            let (pos, idx) = build_fidget_mesh(surf_name, *surf_depth);
-            let mesh = Mesh::from_triangles(surf_name.as_str(), &pos, &idx);
+            let mesh = build_fidget_mesh(surf_name, *surf_depth);
+            *topo = Some(engvis_core::compute_topology(&mesh));
             scene.meshes = vec![mesh];
             scene.materials[0].name = "Surface".into();
             frame.camera.fit_to_scene(scene);
@@ -219,6 +242,7 @@ fn main() {
         surf_name: "gyroid-sphere".into(),
         surf_depth: 6,
         needs_remesh: true,
+        topo: None,
         albedo: [0.25, 0.55, 0.95],
         metallic: 0.2,
         roughness: 0.35,

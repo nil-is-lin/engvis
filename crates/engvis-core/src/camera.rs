@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use crate::scene::Scene;
 use crate::aabb::Aabb;
 
@@ -6,10 +6,9 @@ use crate::aabb::Aabb;
 pub struct OrbitCamera {
     /// Point the camera orbits around
     pub target: Vec3,
-    /// Azimuth angle (radians, around Y axis)
-    pub yaw: f32,
-    /// Elevation angle (radians, clamped)
-    pub pitch: f32,
+    /// Camera orientation as a quaternion (camera-space → world-space).
+    /// Replaces yaw/pitch Euler angles — no gimbal lock, no pitch clamp.
+    pub orientation: Quat,
     /// Distance from target
     pub distance: f32,
     /// Vertical field of view (radians)
@@ -26,8 +25,7 @@ impl OrbitCamera {
     pub fn new(target: Vec3, distance: f32) -> Self {
         Self {
             target,
-            yaw: -0.785, // -45 degrees
-            pitch: 0.615, // ~35 degrees
+            orientation: Quat::from_rotation_y(-0.785) * Quat::from_rotation_x(-0.615),
             distance,
             fov_y: std::f32::consts::FRAC_PI_4, // 45 degrees
             near: 0.01,
@@ -36,44 +34,41 @@ impl OrbitCamera {
         }
     }
 
-    /// Target + distance variant (no pitch/yaw offset).
+    /// Target + distance variant (identity orientation).
     pub fn looking_at(target: Vec3, distance: f32) -> Self {
         Self {
             target,
-            yaw: 0.0,
-            pitch: 0.0,
+            orientation: Quat::IDENTITY,
             distance,
             ..Default::default()
         }
     }
 
-    /// Camera world-space position
+    /// Camera world-space position.
+    /// Camera sits at +Z in camera space relative to target, so the
+    /// target→camera direction is `orientation * Vec3::Z`.
     pub fn position(&self) -> Vec3 {
-        let cos_pitch = self.pitch.cos();
-        let offset = Vec3::new(
-            self.distance * cos_pitch * self.yaw.sin(),
-            self.distance * self.pitch.sin(),
-            self.distance * cos_pitch * self.yaw.cos(),
-        );
-        self.target + offset
+        self.target + self.orientation * (Vec3::Z * self.distance)
     }
 
-    /// Right direction vector
+    /// Right direction vector (camera local +X in world space)
     pub fn right(&self) -> Vec3 {
-        let forward = (self.target - self.position()).normalize();
-        forward.cross(Vec3::Y).normalize()
+        self.orientation * Vec3::X
     }
 
-    /// Up direction vector
+    /// Up direction vector (camera local +Y in world space)
     pub fn up(&self) -> Vec3 {
-        let forward = (self.target - self.position()).normalize();
-        let right = forward.cross(Vec3::Y).normalize();
-        right.cross(forward).normalize()
+        self.orientation * Vec3::Y
     }
 
-    /// View matrix (world -> camera)
+    /// View matrix (world → camera).
+    /// Constructed directly from the orientation quaternion to avoid
+    /// degeneracies that `look_at_rh` suffers when the view direction
+    /// aligns with the up vector (poles).
     pub fn view_matrix(&self) -> Mat4 {
-        Mat4::look_at_rh(self.position(), self.target, Vec3::Y)
+        let rot = Mat4::from_quat(self.orientation.inverse());
+        let trans = Mat4::from_translation(-self.position());
+        rot * trans
     }
 
     /// Projection matrix
@@ -86,13 +81,21 @@ impl OrbitCamera {
         self.projection_matrix() * self.view_matrix()
     }
 
-    /// Orbit by delta yaw/pitch
+    /// Orbit by incremental rotation.
+    ///
+    /// `delta_yaw`   — rotation around world up (Y), keeps the horizon level.
+    /// `delta_pitch` — rotation around the camera's local right axis (tilt).
+    ///
+    /// Both are applied as incremental quaternion multiplications, so there
+    /// is no gimbal lock and no pitch clamp — the camera can rotate freely.
     pub fn orbit(&mut self, delta_yaw: f32, delta_pitch: f32) {
-        self.yaw += delta_yaw;
-        self.pitch = (self.pitch + delta_pitch).clamp(
-            -std::f32::consts::FRAC_PI_2 + 0.01,
-            std::f32::consts::FRAC_PI_2 - 0.01,
-        );
+        // Yaw: pre-multiply (world-space rotation around Y)
+        let yaw_rot = Quat::from_rotation_y(delta_yaw);
+        // Pitch: post-multiply (local-space rotation around camera X).
+        // Negate so that positive delta_pitch raises the camera, matching
+        // the old Euler convention where pitch > 0 = camera above target.
+        let pitch_rot = Quat::from_rotation_x(-delta_pitch);
+        self.orientation = (yaw_rot * self.orientation * pitch_rot).normalize();
     }
 
     /// Pan the target point in camera-local XY
@@ -126,28 +129,29 @@ impl OrbitCamera {
         self.fit_to_aabb(scene.compute_aabb());
     }
 
+    /// Set orientation from yaw/pitch angles (compatibility helper).
+    pub fn set_orientation_yaw_pitch(&mut self, yaw: f32, pitch: f32) {
+        self.orientation = Quat::from_rotation_y(yaw) * Quat::from_rotation_x(-pitch);
+    }
+
     /// Preset: front view
     pub fn view_front(&mut self) {
-        self.yaw = 0.0;
-        self.pitch = 0.0;
+        self.orientation = Quat::IDENTITY;
     }
 
     /// Preset: top view
     pub fn view_top(&mut self) {
-        self.yaw = 0.0;
-        self.pitch = std::f32::consts::FRAC_PI_2 - 0.01;
+        self.orientation = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
     }
 
     /// Preset: right view
     pub fn view_right(&mut self) {
-        self.yaw = -std::f32::consts::FRAC_PI_2;
-        self.pitch = 0.0;
+        self.orientation = Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2);
     }
 
     /// Preset: isometric view
     pub fn view_iso(&mut self) {
-        self.yaw = -0.785;
-        self.pitch = 0.615;
+        self.orientation = Quat::from_rotation_y(-0.785) * Quat::from_rotation_x(-0.615);
     }
 }
 

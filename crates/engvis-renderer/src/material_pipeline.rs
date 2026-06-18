@@ -157,7 +157,7 @@ impl MaterialPipeline {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None, // open surfaces (e.g. gyroid) need double-sided rendering
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -389,9 +389,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let B = normalize(in.world_bitangent);
     let Ng = normalize(in.world_normal);
     let TBN = mat3x3<f32>(T, B, Ng);
-    let N = normalize(TBN * (sampled_normal * vec3<f32>(material.normal_scale, material.normal_scale, 1.0)));
+    var N = normalize(TBN * (sampled_normal * vec3<f32>(material.normal_scale, material.normal_scale, 1.0)));
 
     let V = normalize(scene.camera_pos.xyz - in.world_pos);
+    // Double-sided lighting: flip N if it points away from the viewer
+    // (needed for open surfaces rendered without back-face culling).
+    if (dot(N, V) < 0.0) {
+        N = -N;
+    }
     let F0 = mix(vec3<f32>(0.04), base_color.rgb, metallic);
 
     var Lo = vec3<f32>(0.0);

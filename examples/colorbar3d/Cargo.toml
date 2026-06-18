@@ -1,0 +1,13 @@
+[package]
+name = "colorbar3d"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+engvis-core = { path = "../../crates/engvis-core" }
+engvis-renderer = { path = "../../crates/engvis-renderer" }
+winit.workspace = true
+egui.workspace = true
+log.workspace = true
+env_logger.workspace = true
+glam.workspace = true

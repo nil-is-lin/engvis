@@ -13,6 +13,7 @@ pub mod lighting;
 pub mod gltf_loader;
 pub mod texture_cache;
 pub mod custom_material;
+pub mod postprocess;
 pub mod app;
 
 pub use gpu::{GpuContext, GpuResources, create_window_and_gpu};

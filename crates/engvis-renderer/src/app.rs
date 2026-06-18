@@ -435,6 +435,7 @@ impl<A: EngvisApp + 'static> ApplicationHandler for AppRunner<A> {
            full_output,
            |view, encoder| {
                renderer.render_scene_pass(device, queue, view, encoder, scene, camera, size.width, size.height);
+               renderer.render_post_process(device, encoder, view, size.width, size.height);
            },
        );
 

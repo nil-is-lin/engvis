@@ -12,6 +12,10 @@ pub struct SceneNode {
     pub mesh_index: Option<usize>,
     pub children: Vec<SceneNode>,
     pub visible: bool,
+    /// Whether to draw this node's edges in the edge-overlay pass.
+    /// Used for wireframe bounding boxes / outlines that should not
+    /// light up every triangle edge of the surface mesh.
+    pub render_edges: bool,
 }
 
 /// The top-level scene containing all data
@@ -52,6 +56,7 @@ impl Scene {
                 mesh_index: Some(0),
                 children: Vec::new(),
                 visible: true,
+                render_edges: false,
             }],
             lighting: LightingEnvironment::default(),
         }

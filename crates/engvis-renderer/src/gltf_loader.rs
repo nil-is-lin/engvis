@@ -256,6 +256,7 @@ pub fn load_gltf(
             mesh_index: node.mesh().map(|m| m.index()),
             children: node.children().map(|child| load_node(&child)).collect(),
             visible: true,
+            render_edges: false,
         }
     }
 

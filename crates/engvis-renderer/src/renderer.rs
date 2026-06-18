@@ -10,6 +10,7 @@ use crate::mesh_renderer::MeshRenderer;
 use crate::overlay_renderer::OverlayRenderer;
 use crate::texture_cache::TextureCache;
 use crate::custom_material::CustomMaterial;
+use crate::postprocess::PostProcessPipeline;
 
 
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +50,11 @@ pub struct Renderer {
     sample_count: u32,
     /// Optional custom material override.
     custom_material: Option<Box<dyn CustomMaterial>>,
+    /// FXAA post-processing pipeline.
+    post_process: PostProcessPipeline,
+    /// Intermediate texture for FXAA input (MSAA-resolved or direct scene output).
+    fxaa_texture: wgpu::Texture,
+    fxaa_view: wgpu::TextureView,
 }
 
 impl Renderer {
@@ -145,6 +151,21 @@ impl Renderer {
 
         let texture_cache = TextureCache::new(device, queue);
 
+        let post_process = PostProcessPipeline::new(device, surface_format);
+        let w = width.max(1);
+        let h = height.max(1);
+        let fxaa_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("FXAA Intermediate Texture"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let fxaa_view = fxaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let mut renderer = Self {
             depth,
             msaa_texture,
@@ -162,6 +183,9 @@ impl Renderer {
             state: RenderState::default(),
             sample_count: sc,
             custom_material: None,
+            post_process,
+            fxaa_texture,
+            fxaa_view,
         };
 
         renderer.upload_scene(device, queue, scene);
@@ -248,6 +272,19 @@ impl Renderer {
             view_formats: &[],
         });
         self.msaa_view = self.msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Recreate FXAA intermediate texture
+        self.fxaa_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("FXAA Intermediate Texture"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.fxaa_view = self.fxaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
     }
 
     // ── Render pass ─────────────────────────────────────────
@@ -257,7 +294,7 @@ impl Renderer {
        &self,
        device: &wgpu::Device,
        queue: &wgpu::Queue,
-       view: &wgpu::TextureView,
+       _view: &wgpu::TextureView,
        encoder: &mut wgpu::CommandEncoder,
        scene: &Scene,
        camera: &OrbitCamera,
@@ -284,9 +321,9 @@ impl Renderer {
         let s = &self.state;
         let depth_tex = &self.depth;
 
-        // Begin render pass with shared MSAA target (or direct to view if no MSAA)
-        let resolve_target = if self.sample_count > 1 { Some(view) } else { None };
-        let color_view = if self.sample_count > 1 { &self.msaa_view } else { view };
+        // Scene always renders to intermediate texture (FXAA post-process reads from it)
+        let resolve_target = if self.sample_count > 1 { Some(&self.fxaa_view) } else { None };
+        let color_view = if self.sample_count > 1 { &self.msaa_view } else { &self.fxaa_view };
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Main Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -349,6 +386,26 @@ impl Renderer {
             render_pass.set_pipeline(&self.overlay_renderer.point_pipeline);
             self.render_overlay_nodes(&mut render_pass, scene, device, Affine3A::IDENTITY, &overlay_bg, OverlayDrawMode::Vertices);
         }
+    }
+
+    /// Apply FXAA post-processing: read from the intermediate scene texture,
+    /// write the anti-aliased result to `dest_view` (typically the surface texture).
+    pub fn render_post_process(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        dest_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
+        self.post_process.render(
+            device,
+            encoder,
+            &self.fxaa_view,
+            dest_view,
+            width,
+            height,
+        );
     }
 
     fn render_scene_nodes(
@@ -444,7 +501,13 @@ impl Renderer {
 
         let world_transform = parent_transform * node.local_transform;
 
-        if let Some(mesh_idx) = node.mesh_index
+        // Skip this node's mesh if the overlay mode is Edges but the
+        // node is not marked for edge rendering (e.g. surface meshes
+        // whose every triangle edge would otherwise light up).
+        let skip_mesh = matches!(mode, OverlayDrawMode::Edges) && !node.render_edges;
+
+        if !skip_mesh
+            && let Some(mesh_idx) = node.mesh_index
             && mesh_idx < self.mesh_renderer.mesh_buffers.len() {
                 let mesh_buf = &self.mesh_renderer.mesh_buffers[mesh_idx];
 

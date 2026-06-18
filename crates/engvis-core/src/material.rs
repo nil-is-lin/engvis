@@ -63,7 +63,7 @@ pub struct EdgeRenderOptions {
 impl Default for EdgeRenderOptions {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             color: [0.2, 0.8, 1.0],
             line_width: 5.0,
         }

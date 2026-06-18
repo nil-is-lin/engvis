@@ -1,0 +1,294 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usepackage{booktabs}
+
+\geometry{margin=2.5cm}
+
+\lstdefinelanguage{Rust}{
+  keywords={fn,let,mut,for,in,if,else,while,loop,match,return,struct,impl,pub,use,mod,as,where,move,ref,self,Self,crate,super,async,await,unsafe,const,static,type,enum,trait, dyn, true, false},
+  keywordstyle=\color{blue!70!black}\bfseries,
+  ndkeywords={Vec,Vec3,Vec4,Quat,Mat4,u32,usize,f32,f64,bool,Option,Some,None,Result,Ok,Err,String},
+  ndkeywordstyle=\color{purple!70!black}\bfseries,
+  sensitive=true,
+  comment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!70!black},
+  morestring=[b]",
+}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  language=Rust,
+  showstringspaces=false,
+  tabsize=2,
+}
+
+\title{Orbit Camera: Euler-to-Quaternion Refactor}
+\author{engvis}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Problem Statement}
+
+The orbit camera in \texttt{crates/engvis-core/src/camera.rs}
+originally stored its orientation as two Euler angles:
+\begin{itemize}
+  \item \texttt{yaw} --- azimuth around the world $Y$ axis,
+  \item \texttt{pitch} --- elevation, clamped to
+        $\pm(\tfrac{\pi}{2} - 0.01) \approx \pm 89.4^\circ$.
+\end{itemize}
+
+When the user drags the mouse to rotate the view vertically, the
+camera stops responding once \texttt{pitch} reaches the clamp
+boundary.  The view cannot be rotated past nearly straight up/down,
+which is perceived as a hard boundary on interaction.
+
+\section{Root Cause Analysis}
+
+\subsection{Pitch Clamp}
+
+The clamp is required by the Euler representation itself, not by any
+physical constraint of the scene.  In \texttt{orbit()}:
+
+\begin{lstlisting}
+pub fn orbit(&mut self, delta_yaw: f32, delta_pitch: f32) {
+    self.yaw += delta_yaw;
+    self.pitch = (self.pitch + delta_pitch).clamp(
+        -std::f32::consts::FRAC_PI_2 + 0.01,
+         std::f32::consts::FRAC_PI_2 - 0.01,
+    );
+}
+\end{lstlisting}
+
+Without the clamp, \texttt{pitch} would exceed $\pm\tfrac{\pi}{2}$,
+which causes two failure modes:
+\begin{enumerate}
+  \item \textbf{Gimbal lock.}  At $\texttt{pitch} = \pm\tfrac{\pi}{2}$,
+        the yaw and pitch rotation axes coincide, and the camera loses
+        one degree of freedom.  Subsequent yaw input produces no
+        visible rotation.
+  \item \textbf{Up-vector flip.}  \texttt{view\_matrix()} uses
+        \texttt{Mat4::look\_at\_rh(pos, target, Vec3::Y)}, which
+        degenerates when the view direction aligns with $\pm Y$:
+        the cross product $\text{forward} \times \text{up}$ vanishes,
+        producing a NaN view matrix.
+\end{enumerate}
+
+\subsection{Why Euler Angles Are Inappropriate}
+
+Euler angles parameterise $\mathrm{SO}(3)$ with a triple
+$(\alpha, \beta, \gamma)$, but the map
+\[
+  (\alpha, \beta, \gamma) \mapsto R_z(\alpha) R_y(\beta) R_z(\gamma)
+\]
+is singular at $\beta = \pm \tfrac{\pi}{2}$ (gimbal lock).  Any
+clamping strategy therefore imposes an artificial boundary on user
+input, even though the underlying rotation space
+$\mathrm{SO}(3) \cong \mathbb{RP}^3$ has no such boundary.
+
+\section{Solution: Quaternion Orientation}
+
+\subsection{Representation}
+
+Replace the two Euler angles with a single unit quaternion
+\texttt{orientation: Quat} that maps camera-local axes to world-space
+directions:
+\begin{itemize}
+  \item camera $+X$ (right) $\mapsto$ \texttt{orientation * Vec3::X},
+  \item camera $+Y$ (up)    $\mapsto$ \texttt{orientation * Vec3::Y},
+  \item camera $+Z$ (back, away from target) $\mapsto$
+        \texttt{orientation * Vec3::Z}.
+\end{itemize}
+
+The camera position is then
+\[
+  \mathbf{p}_{\text{cam}} = \mathbf{t} + \mathbf{q} \, (d \cdot \hat{\mathbf{z}}),
+\]
+where $\mathbf{t}$ is the orbit target, $\mathbf{q}$ the orientation
+quaternion, and $d$ the orbit distance.
+
+\begin{lstlisting}
+pub struct OrbitCamera {
+    pub target: Vec3,
+    pub orientation: Quat,
+    pub distance: f32,
+    pub fov_y: f32,
+    pub near: f32,
+    pub far: f32,
+    pub aspect_ratio: f32,
+}
+
+pub fn position(&self) -> Vec3 {
+    self.target + self.orientation * (Vec3::Z * self.distance)
+}
+\end{lstlisting}
+
+\subsection{Incremental Orbit Rotation}
+
+Mouse drag produces two incremental rotations per frame:
+\begin{itemize}
+  \item \textbf{Yaw} $\Delta\alpha$ --- rotation about the world up
+        axis $Y$.  Applied as a \emph{pre-multiplication}
+        $\mathbf{q}' = R_Y(\Delta\alpha) \, \mathbf{q}$ so the horizon
+        stays level regardless of the camera's current pitch.
+  \item \textbf{Pitch} $\Delta\beta$ --- rotation about the camera's
+        local $X$ axis.  Applied as a \emph{post-multiplication}
+        $\mathbf{q}' \leftarrow \mathbf{q}' \, R_X(-\Delta\beta)$,
+        where the sign preserves the old ``drag up = look up''
+        convention.
+\end{itemize}
+
+\[
+  \mathbf{q}_{\text{new}}
+  = \mathrm{normalize}\!\left(
+      R_Y(\Delta\alpha) \;\cdot\; \mathbf{q}_{\text{old}} \;\cdot\; R_X(-\Delta\beta)
+    \right).
+\]
+
+Because quaternion multiplication is a closed, smooth operation on
+$\mathrm{SO}(3)$, no clamp is required and no singularity arises at
+any orientation.
+
+\begin{lstlisting}
+pub fn orbit(&mut self, delta_yaw: f32, delta_pitch: f32) {
+    let yaw_rot   = Quat::from_rotation_y(delta_yaw);
+    let pitch_rot = Quat::from_rotation_x(-delta_pitch);
+    self.orientation = (yaw_rot * self.orientation * pitch_rot).normalize();
+}
+\end{lstlisting}
+
+The final \texttt{.normalize()} guards against floating-point drift
+after many incremental updates; it is a numerical safeguard, not a
+behavioural clamp.
+
+\subsection{View Matrix from Quaternion}
+
+The previous implementation used
+\texttt{Mat4::look\_at\_rh(position(), target, Vec3::Y)}, which
+degenerates when $\text{forward} \parallel \text{up}$.  The new
+implementation builds the view matrix directly from the orientation
+quaternion:
+\[
+  V = R(\mathbf{q}^{-1}) \, T(-\mathbf{p}_{\text{cam}}),
+\]
+where $R(\mathbf{q}^{-1})$ is the world-to-camera rotation and
+$T(-\mathbf{p}_{\text{cam}})$ translates the camera to the origin.
+
+\begin{lstlisting}
+pub fn view_matrix(&self) -> Mat4 {
+    let rot  = Mat4::from_quat(self.orientation.inverse());
+    let trans = Mat4::from_translation(-self.position());
+    rot * trans
+}
+\end{lstlisting}
+
+This formulation is well-defined for every orientation, including
+straight up/down and upside-down views.
+
+\subsection{Preset Views}
+
+Each preset constructs the orientation quaternion directly from the
+relevant axis rotations:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Preset & Orientation & Description \\
+\midrule
+\texttt{view\_front} & $\mathbf{q} = I$ & camera at $+Z$, looking at $-Z$ \\
+\texttt{view\_top}   & $\mathbf{q} = R_X(-\tfrac{\pi}{2})$ & camera at $+Y$, looking at $-Y$ \\
+\texttt{view\_right} & $\mathbf{q} = R_Y(-\tfrac{\pi}{2})$ & camera at $-X$, looking at $+X$ \\
+\texttt{view\_iso}   & $\mathbf{q} = R_Y(-0.785) \, R_X(-0.615)$ & isometric \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{lstlisting}
+pub fn view_front(&mut self) { self.orientation = Quat::IDENTITY; }
+pub fn view_top(&mut self)   { self.orientation = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2); }
+pub fn view_right(&mut self) { self.orientation = Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2); }
+pub fn view_iso(&mut self)  {
+    self.orientation = Quat::from_rotation_y(-0.785) * Quat::from_rotation_x(-0.615);
+}
+\end{lstlisting}
+
+\subsection{Compatibility Helper}
+
+Code that previously set \texttt{yaw}/\texttt{pitch} directly (e.g.\
+the \texttt{colorbar3d} example's reset-view button) now uses
+\texttt{set\_orientation\_yaw\_pitch}, which composes the same
+$R_Y \cdot R_X$ rotation:
+
+\begin{lstlisting}
+pub fn set_orientation_yaw_pitch(&mut self, yaw: f32, pitch: f32) {
+    self.orientation = Quat::from_rotation_y(yaw) * Quat::from_rotation_x(-pitch);
+}
+\end{lstlisting}
+
+\section{Comparison}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Aspect & Euler (yaw, pitch) & Quaternion \\
+\midrule
+Representation        & $(\alpha, \beta)$, $\beta \in (-\tfrac{\pi}{2}, \tfrac{\pi}{2})$ & unit $\mathbf{q} \in S^3$ \\
+Singularity            & at $\beta = \pm \tfrac{\pi}{2}$ (gimbal lock) & none \\
+Pitch clamp           & required & not required \\
+Vertical rotation     & stops at $\pm 89.4^\circ$ & unlimited \\
+View matrix           & \texttt{look\_at\_rh} (degenerate at poles) & direct from $\mathbf{q}^{-1}$ \\
+Up vector             & implicit ($+Y$) & explicit (\texttt{orientation * Vec3::Y}) \\
+Preset views          & set two scalars & construct quaternion \\
+Interpolation         & Euler interpolation flawed & SLERP / NLERP natural \\
+Memory                & 8 bytes & 16 bytes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Pipeline Summary}
+
+The complete camera update pipeline per frame:
+
+\begin{enumerate}
+  \item \textbf{Input} (\texttt{input.rs}) --- mouse drag deltas
+        $(\Delta x, \Delta y)$ scaled by a sensitivity factor.
+  \item \textbf{Orbit} --- \texttt{camera.orbit($-\Delta x \cdot s$,
+        $-\Delta y \cdot s$)} composes incremental quaternion
+        rotations.
+  \item \item \textbf{Pan} (right mouse) --- translates
+        \texttt{target} along camera-local $X$ and $Y$.
+  \item \textbf{Zoom} (scroll) --- scales \texttt{distance} with
+        clamp $[0.1, 500]$.
+  \item \textbf{View matrix} --- built from
+        $\mathbf{q}^{-1}$ and $-\mathbf{p}_{\text{cam}}$.
+  \item \textbf{Projection} --- perspective RH from \texttt{fov\_y},
+        \texttt{aspect\_ratio}, \texttt{near}, \texttt{far}.
+\end{enumerate}
+
+\section{Result}
+
+After the refactor:
+\begin{itemize}
+  \item The camera rotates freely in all directions; no boundary is
+        encountered when looking straight up or down.
+  \item All preset views (front, top, right, iso) reproduce the
+        previous camera framing.
+  \item The \texttt{colorbar3d} example's reset-view button restores
+        the same isometric orientation as before.
+  \item \texttt{cargo build}, \texttt{cargo test --workspace}, and
+        runtime startup all pass without errors.
+\end{itemize}
+
+\end{document}

@@ -19,17 +19,24 @@ pollster.workspace = true
 log.workspace = true
 env_logger.workspace = true
 glam.workspace = true
+fidget-core.workspace = true
+fidget-mesh.workspace = true
+fidget-rhai.workspace = true
+tobj.workspace = true
+stl_io.workspace = true
+ply-rs-bw.workspace = true
+rfd.workspace = true
 
 [workspace]
 resolver = "2"
 members = [
     "crates/engvis-core",
     "crates/engvis-renderer",
-    "fidget-demo",
+    "fidget-demo", "examples/colorbar3d",
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["nil"]
 license = "MIT"
@@ -49,3 +56,9 @@ gltf = "1.4"
 image = "0.25"
 fidget-core = "0.4.3"
 fidget-mesh = "0.4.3"
+fidget-rhai = "0.4.3"
+tobj = "4.0"
+stl_io = "0.8"
+ply-rs-bw = "2.0"
+rfd = "0.15"
+splines = { version = "4.4", features = ["glam"] }
