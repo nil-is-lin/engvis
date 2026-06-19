@@ -22,6 +22,86 @@ All notable changes to this project will be documented in this file.
 - Grid not visible through transparent surface due to rendering order.
 - Edge overlay using hardcoded color instead of user-selected color.
 
+## [0.1.5] - 2026-06-20
+
+### Added
+
+- **Parameterised primitives**: sphere radius (0.1–3.0), torus major/minor radius
+  (0.1–3.0 / 0.02–1.5) controllable from the Source panel, directly below the
+  selected primitive.
+- **Parameterised TPMS**: period slider $k \in [0.5, 10]$ and human-readable
+  implicit equation shown below the dropdown.
+- **Clip radius control**: `clip_radius` slider (0.2–5.0) in the Source panel;
+  sphere wireframe radius and camera adapt to it.
+- **Surface color picker** in the Display panel (Color under Show triangle surface).
+- **3 new Fischer-Koch TPMS**: Fischer-Koch S, Y, CP (10 total).
+- **Adaptive MC33 resolution**: auto-bumps grid resolution when torus tube or
+  TPMS half-period drops below ~3 grid cells (caps at 512). User slider unchanged.
+- **Boundary vertex clamping**: post-MC33 pass clamps coordinates to $[-1,1]^3$,
+  preventing floating-point overshoot from visually overflowing the wireframe cube.
+- **Empty-mesh guard** in all three rendering passes (surface, points, edges):
+  nodes with zero vertex/index/edge-instance counts are silently skipped.
+
+### Changed
+
+- Source panel restructured: primitive shapes are radio buttons, TPMS uses
+  `egui::ComboBox` dropdown.
+- `build_tree` takes a `TreeParams` struct instead of a bare `&str`.
+- `build_mesh` / `build_mc33_mesh` / `build_box_wireframe`: sampling domain
+  remains fixed at $[-1,1]^3$ (adaptive-domain approach explicitly rejected
+  to preserve user feedback on the period slider).
+- Camera always fits to $[-1,1]^3$ regardless of `clip_radius`.
+- Edge-overlay traversal split into a dedicated `render_overlay_nodes_edges`
+  path with per-node color/width overrides (`SceneNode::edge_color_override`,
+  `edge_width_override`).
+
+### Fixed
+
+- Empty mesh on sphere/torus extreme parameters no longer panics (buffer
+  size guards in renderer).
+- `facet-path 0.44.5` dependency conflict pinned in lockfile.
+- Release workflow Windows runner `Connection was reset` mitigated with
+  sparse registry protocol, `cargo fetch` retry loop, and `rust-cache`.
+
+### Documentation
+
+- `doc/mc33-domain-auto-scale.tex`: fixed-unit-domain convention, boundary
+  clamping, and adaptive resolution design.
+
+## [0.1.4] - 2026-06-19
+
+### Added
+
+- **Per-node edge appearance overrides** (`SceneNode::edge_color_override`,
+  `edge_width_override`).  Lets the bounding wireframe / annotations
+  carry their own color and line width, independent of the global
+  triangle-edge overlay.
+- **Display panel UX overhaul**: surface, edges, points, and bounding
+  wireframe are now toggle-driven — controls only appear once the
+  corresponding "Show …" checkbox is enabled (matching the existing
+  *Show points* style).
+- **Bounding wireframe color and line width** controls in the UI.
+
+### Changed
+
+- Edge overlay traversal split into a dedicated path that builds one
+  uniform bind group per node, allowing per-node overrides without
+  duplicating the line pipeline.
+- `OverlayDrawMode` enum removed (was reduced to a single variant
+  after edge handling moved out).
+
+### Fixed
+
+- Release workflow on Windows runners would occasionally fail with
+  `Connection was reset` while pulling crates.io.  Mitigated by:
+  - `CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse`
+  - `CARGO_NET_RETRY=10`, `CARGO_HTTP_MULTIPLEXING=false`,
+    `CARGO_NET_GIT_FETCH_WITH_CLI=true`
+  - explicit `cargo fetch` step with up-to-5-time retry loop
+  - `Swatinem/rust-cache@v2` for registry / target caching
+  - `fail-fast: false` so one platform's transient failure does not
+    cancel the others
+
 ## [0.1.3] - 2026-06-19
 
 ### Changed

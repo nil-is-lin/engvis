@@ -1,0 +1,221 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usetikzlibrary{calc, arrows.meta, positioning, shapes.geometric, fit}
+
+\geometry{margin=2.2cm}
+
+\lstdefinelanguage{Rust}{
+  keywords={fn,let,mut,for,in,if,else,while,loop,match,return,struct,impl,pub,use,mod,as,where,move,ref,self,Self,crate,super,async,await,unsafe,const,static,type,enum,trait,dyn,true,false,continue,break},
+  keywordstyle=\color{blue!70!black}\bfseries,
+  ndkeywords={Vec,Vec3,Mat4,Mesh,MeshVertex,SceneNode,Scene,PbrMaterial,TreeParams,u32,usize,f32,f64,bool,Option,Some,None,Result,Ok,Err,String,k,PI},
+  ndkeywordstyle=\color{purple!70!black}\bfseries,
+  sensitive=true,
+  comment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!70!black},
+  morestring=[b]",
+}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  language=Rust,
+  showstringspaces=false,
+  tabsize=2,
+}
+
+\title{Fixed-Unit-Domain Convention for\\ Triply-Periodic Minimal Surface Visualisation}
+\author{engvis}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+When the user varies the period parameter $k$ of a triply-periodic
+minimal surface (TPMS) inside a fixed $[-1,1]^3$ unit cube, the
+visual density of the isosurface changes predictably: larger $k$
+means more periods visible.  This is the expected behaviour---the
+unit cube serves as a fixed ``window'' through which the periodic
+pattern is observed.
+
+This note documents the convention and explains why an adaptive
+domain (scaling the cube to keep one period always visible) was
+explicitly rejected: it removes the user's visual feedback for
+the period slider, making it impossible to judge whether the
+pattern is getting denser or sparser.
+\end{abstract}
+
+% =====================================================================
+\section{Design Principle}
+
+The engvis viewer maintains a \emph{fixed unit domain} for all
+implicit surfaces (sphere, torus, TPMS, custom Rhai expressions).
+The sampling grid for Marching Cubes~33 is always
+\begin{equation}\label{eq:domain}
+  \Omega = [-1,\,1]^3,
+\end{equation}
+and the bounding wireframe cube is likewise fixed at $\pm 1$.  The
+orbit camera is initialised to fit this same box, so the user
+always views the same physical volume.
+
+When the user drags the \texttt{Period k} slider from $k=4$ to
+$k=8$, the trigonometric argument changes from $4x$ to $8x$,
+putting twice as many periods inside $\Omega$ (Figure~\ref{fig:compare}).
+The surface visibly ``densifies''---which is exactly the feedback
+the user expects from a parameter control.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    every node/.style={font=\small},
+    box/.style={draw, minimum width=28mm, minimum height=18mm,
+                rounded corners=1mm, align=center},
+  ]
+  \node[box, fill=green!8]  (k4)  {$k=4$\\$P\approx 1.3$};
+  \node[box, fill=orange!10, right=12mm of k4] (k8) {$k=8$\\$P\approx 2.5$};
+  \draw[->, thick] (k4) -- node[above, font=\footnotesize]{same cube} (k8);
+  \node[fit=(k4)(k8), draw, dashed, inner sep=4mm, label=above:{$\Omega=[-1,1]^3$}] {};
+\end{tikzpicture}
+\caption{Left: $k=4$---about 1.3 periods inside the unit cube.
+Right: $k=8$---about 2.5 periods.  The cube stays the same;
+the surface visibly gets denser.}
+\label{fig:compare}
+\end{figure}
+
+% =====================================================================
+\section{Why Not an Adaptive Domain?}
+
+An alternative considered and rejected was to scale the domain
+width $D(k) = 2\pi/k$ so that exactly one period is always visible,
+then scale the wireframe and camera to match (the ``auto-scale''
+approach).  This keeps the visual proportion constant but
+\emph{destroys the user experience} of the period slider:
+
+\begin{itemize}[leftmargin=2em]
+  \item The surface looks \textbf{exactly the same} for all $k$
+        values---the slider has no visible effect.
+  \item MC~33 accuracy degrades when $D(k) < 1$ because the same
+        $R^3$ grid cells are stretched over a smaller volume,
+        increasing the effective resolution unnecessarily.
+  \item The wireframe cube shrinks or grows simultaneously with the
+        slider, defeating the purpose of having a fixed reference
+        frame.
+\end{itemize}
+
+The chosen convention (fixed unit domain) is also simpler: no
+extra parameters, no camera/logic coupling between domain sizing
+and clipping.
+
+% =====================================================================
+\section{Edge Cases}
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{$k$ very large ($\to 10$)}.  $P \approx 3.2$ periods
+    fit inside $\Omega$.  The surface becomes very dense; the mesh may
+    have many small triangles but remains inside the wireframe.
+    \texttt{clip\_to\_unit\_ball}
+    provides manual control over which portion of the dense surface
+    is visible.
+  \item \textbf{$k$ very small ($\to 0.5$)}.  $P \approx 0.16$.
+    Only a fraction of a period is visible---the surface looks like a
+    smooth patch.  This is acceptable because the slider covers the
+    full range deliberately.
+\end{itemize}
+
+% =====================================================================
+\section{Boundary Vertex Clamping}
+
+When MC~33 evaluates $f$ at domain boundaries $(\pm1, y, z)$ and
+the neighbouring interior sample has opposite sign, the face carries
+a zero-crossing.  The linear interpolation factor
+$t = \frac{v_a}{v_a-v_b}$ can land fractionally outside
+$[-1,\,1]$ when $v_a$ (the boundary sample) is polluted by
+floating-point noise.  Without correction, a few vertices end up at
+$a \in \{x,y,z\} = 1.0000001$, visually ``overflowing'' the
+wireframe cube.
+
+A simple post-extraction clamp fixes this in $O(N)$ with zero
+perceptual impact:
+\begin{lstlisting}
+let (mut pos, idx) = marching_cubes::extract(f, ...);
+for p in &mut pos {
+    for v in &mut *p {
+        if *v < -1.0 { *v = -1.0; }
+        if *v >  1.0 { *v =  1.0; }
+    }
+}
+\end{lstlisting}
+Only coordinates that deviate by a few machine epsilons are touched;
+the topology (\emph{which} edge carries an intersection) is unaffected.
+
+% =====================================================================
+\section{Adaptive Resolution}
+
+A deeper problem surfaces when the implicit function contains features
+thinner than $\approx 3$ grid cells.  The MC~33 grid cannot resolve
+sub-cell topology, producing degenerate triangles and visually broken
+meshes---most notably when the torus minor radius is dragged below
+$\approx 0.05$ at the default resolution $R=64$.
+
+The fix is a heuristic \textbf{auto-resolution bump} that runs
+before every mesh build.  For each surface type a minimum resolved
+feature size is estimated:
+
+\begin{table}[h]
+\centering
+\caption{Minimum feature-size estimates used for resolution bumping.}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Surface} & \textbf{Feature} & \textbf{Needed $R$} \\
+\midrule
+Torus  & $2\,r$ (tube diameter) & $R \ge 6 / (2r)$ \\
+TPMS   & $\pi/k$ (half-period) & $R \ge 6k / \pi$ \\
+Sphere \& others & $0.5$ (generous) & always $\ge R_{\text{user}}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The requested resolution is clamped to $[\text{user }R,\;512]$.
+When the bump activates the console prints a diagnostic line:
+\begin{lstlisting}
+[MC33] auto-bump res 64 -> 160 (feature 0.040)
+\end{lstlisting}
+The user-visible slider still shows 64; the bump is transparent.
+
+% =====================================================================
+\section{Code Layout}
+
+The two fixes sit in neighbouring lines of \texttt{src/main.rs}:
+\begin{lstlisting}
+// 1. Boundary clamp (in build_mc33_mesh)
+for p in &mut pos {
+    for v in &mut *p {
+        if *v < -1.0 { *v = -1.0; }
+        if *v >  1.0 { *v =  1.0; }
+    }
+}
+
+// 2. Adaptive resolution (in build_scene)
+let effective_res = {
+    let min_feature = match &self.source { ... };
+    ((6.0 / min_feature) as usize).max(self.mc_res).min(512)
+};
+\end{lstlisting}
+
+Wireframe \& camera are static---same fixed-unit-domain convention as
+before---so the reference frame the user sees remains unchanged
+regardless of internal resolution adjustments.
+
+\end{document}

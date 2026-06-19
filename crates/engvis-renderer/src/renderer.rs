@@ -13,11 +13,8 @@ use crate::custom_material::CustomMaterial;
 use crate::postprocess::PostProcessPipeline;
 
 
-#[derive(Debug, Clone, Copy)]
-enum OverlayDrawMode {
-    Vertices,
-    Edges,
-}
+
+
 
 /// Scene uniform data (group 0)
 #[repr(C)]
@@ -370,13 +367,14 @@ impl Renderer {
        }
 
        // --- Edge overlay ---
-      if s.edge_opts.enabled {
-          let (_buf, overlay_bg) = self
-              .overlay_renderer
-              .create_uniform_bind_group(device, s.edge_opts.color, 0.0, s.edge_opts.line_width);
-          render_pass.set_pipeline(&self.overlay_renderer.line_pipeline);
-          self.render_overlay_nodes(&mut render_pass, scene, device, Affine3A::IDENTITY, &overlay_bg, OverlayDrawMode::Edges);
-      }
+       if s.edge_opts.enabled {
+           render_pass.set_pipeline(&self.overlay_renderer.line_pipeline);
+           self.render_overlay_nodes_edges(
+               &mut render_pass, scene, device,
+               Affine3A::IDENTITY,
+               s.edge_opts.color, s.edge_opts.line_width,
+           );
+       }
 
         // --- Vertex overlay ---
         if s.vertex_opts.enabled {
@@ -384,7 +382,7 @@ impl Renderer {
                 .overlay_renderer
                 .create_uniform_bind_group(device, s.vertex_opts.color, s.vertex_opts.point_size, 0.0);
             render_pass.set_pipeline(&self.overlay_renderer.point_pipeline);
-            self.render_overlay_nodes(&mut render_pass, scene, device, Affine3A::IDENTITY, &overlay_bg, OverlayDrawMode::Vertices);
+            self.render_overlay_nodes_vertices(&mut render_pass, scene, device, Affine3A::IDENTITY, &overlay_bg);
         }
     }
 
@@ -435,8 +433,11 @@ impl Renderer {
         let world_transform = parent_transform * node.local_transform;
 
         if let Some(mesh_idx) = node.mesh_index
-            && mesh_idx < self.mesh_renderer.mesh_buffers.len() {
-                let mesh_buf = &self.mesh_renderer.mesh_buffers[mesh_idx];
+            && mesh_idx < self.mesh_renderer.mesh_buffers.len()
+            && let mesh_buf = &self.mesh_renderer.mesh_buffers[mesh_idx]
+            && mesh_buf.vertex_count > 0 && mesh_buf.index_count > 0
+            && mesh_idx < scene.meshes.len()
+        {
                 let mesh = &scene.meshes[mesh_idx];
 
                 render_pass.set_vertex_buffer(0, mesh_buf.vertex_buffer.slice(..));
@@ -472,69 +473,119 @@ impl Renderer {
         }
     }
 
-    fn render_overlay_nodes(
+    fn render_overlay_nodes_vertices(
         &self,
         render_pass: &mut wgpu::RenderPass,
         scene: &Scene,
         device: &wgpu::Device,
         parent_transform: Affine3A,
         overlay_bind_group: &wgpu::BindGroup,
-        mode: OverlayDrawMode,
     ) {
-       for node in &scene.nodes {
-           self.render_overlay_node(render_pass, device, node, parent_transform, overlay_bind_group, mode);
-       }
+        for node in &scene.nodes {
+            self.render_overlay_node_vertices(render_pass, device, node, parent_transform, overlay_bind_group);
+        }
     }
 
-   fn render_overlay_node(
-       &self,
-       render_pass: &mut wgpu::RenderPass,
-       device: &wgpu::Device,
+    fn render_overlay_node_vertices(
+        &self,
+        render_pass: &mut wgpu::RenderPass,
+        device: &wgpu::Device,
         node: &engvis_core::SceneNode,
         parent_transform: Affine3A,
         overlay_bind_group: &wgpu::BindGroup,
-        mode: OverlayDrawMode,
     ) {
         if !node.visible {
             return;
         }
-
         let world_transform = parent_transform * node.local_transform;
 
-        // Skip this node's mesh if the overlay mode is Edges but the
-        // node is not marked for edge rendering (e.g. surface meshes
-        // whose every triangle edge would otherwise light up).
-        let skip_mesh = matches!(mode, OverlayDrawMode::Edges) && !node.render_edges;
+        if let Some(mesh_idx) = node.mesh_index
+            && mesh_idx < self.mesh_renderer.mesh_buffers.len()
+            && let mesh_buf = &self.mesh_renderer.mesh_buffers[mesh_idx]
+            && mesh_buf.vertex_count > 0
+        {
+            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            let (_obj_buf, obj_bg) = self
+                .mesh_renderer
+                .create_object_bind_group(device, world_transform);
+            render_pass.set_bind_group(1, &obj_bg, &[]);
+            render_pass.set_bind_group(2, overlay_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, mesh_buf.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.overlay_renderer.point_quad_buffer.slice(..));
+            render_pass.draw(0..6, 0..mesh_buf.vertex_count);
+        }
 
-        if !skip_mesh
+        for child in &node.children {
+            self.render_overlay_node_vertices(render_pass, device, child, world_transform, overlay_bind_group);
+        }
+    }
+
+    // ── Edge-overlay traversal with per-node color / width overrides ─
+    //
+    // Walks the scene graph the same way as `render_overlay_nodes`, but
+    // for each node draws its edges with a uniform bind group built
+    // from the (optionally-overridden) color and line width.  This lets
+    // wireframe / annotation nodes have their own appearance independent
+    // of the global `edge_opts` used for triangle-mesh edges.
+    fn render_overlay_nodes_edges(
+        &self,
+        render_pass: &mut wgpu::RenderPass,
+        scene: &Scene,
+        device: &wgpu::Device,
+        parent_transform: Affine3A,
+        default_color: [f32; 3],
+        default_width: f32,
+    ) {
+        for node in &scene.nodes {
+            self.render_overlay_node_edges(
+                render_pass, device, node, parent_transform,
+                default_color, default_width,
+            );
+        }
+    }
+
+    fn render_overlay_node_edges(
+        &self,
+        render_pass: &mut wgpu::RenderPass,
+        device: &wgpu::Device,
+        node: &engvis_core::SceneNode,
+        parent_transform: Affine3A,
+        default_color: [f32; 3],
+        default_width: f32,
+    ) {
+        if !node.visible {
+            return;
+        }
+        let world_transform = parent_transform * node.local_transform;
+
+        if node.render_edges
             && let Some(mesh_idx) = node.mesh_index
-            && mesh_idx < self.mesh_renderer.mesh_buffers.len() {
-                let mesh_buf = &self.mesh_renderer.mesh_buffers[mesh_idx];
+            && mesh_idx < self.mesh_renderer.mesh_buffers.len()
+            && let mesh_buf = &self.mesh_renderer.mesh_buffers[mesh_idx]
+            && mesh_buf.edge_instance_count > 0
+        {
+            let color = node.edge_color_override.unwrap_or(default_color);
+            let width = node.edge_width_override.unwrap_or(default_width);
+            let (_buf, overlay_bg) = self
+                .overlay_renderer
+                .create_uniform_bind_group(device, color, 0.0, width);
 
-                render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            let (_obj_buf, obj_bg) = self
+                .mesh_renderer
+                .create_object_bind_group(device, world_transform);
+            render_pass.set_bind_group(1, &obj_bg, &[]);
+            render_pass.set_bind_group(2, &overlay_bg, &[]);
+            render_pass.set_vertex_buffer(0, mesh_buf.edge_endpoint_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.overlay_renderer.line_quad_buffer.slice(..));
+            render_pass.draw(0..6, 0..mesh_buf.edge_instance_count);
+        }
 
-                let (_obj_buf, obj_bg) = self
-                    .mesh_renderer
-                    .create_object_bind_group(device, world_transform);
-                render_pass.set_bind_group(1, &obj_bg, &[]);
-                render_pass.set_bind_group(2, overlay_bind_group, &[]);
-
-                match mode {
-                    OverlayDrawMode::Vertices => {
-                        render_pass.set_vertex_buffer(0, mesh_buf.vertex_buffer.slice(..));
-                        render_pass.set_vertex_buffer(1, self.overlay_renderer.point_quad_buffer.slice(..));
-                        render_pass.draw(0..6, 0..mesh_buf.vertex_count);
-                    }
-                    OverlayDrawMode::Edges => {
-                        render_pass.set_vertex_buffer(0, mesh_buf.edge_endpoint_buffer.slice(..));
-                        render_pass.set_vertex_buffer(1, self.overlay_renderer.line_quad_buffer.slice(..));
-                        render_pass.draw(0..6, 0..mesh_buf.edge_instance_count);
-                    }
-                }
-            }
-
-       for child in &node.children {
-           self.render_overlay_node(render_pass, device, child, world_transform, overlay_bind_group, mode);
-       }
+        for child in &node.children {
+            self.render_overlay_node_edges(
+                render_pass, device, child, world_transform,
+                default_color, default_width,
+            );
+        }
     }
 }

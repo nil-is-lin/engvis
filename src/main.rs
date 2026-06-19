@@ -21,36 +21,55 @@ use engvis_renderer::{
 // 1. Implicit surface definition (shared by DC and MC33)
 // =====================================================================
 
+/// Parameters for building an implicit surface tree.
+#[derive(Clone, Debug)]
+struct TreeParams<'a> {
+    name: &'a str,
+    sphere_radius: f32,
+    torus_major_r: f32,
+    torus_minor_r: f32,
+    tpms_period: f32,
+}
+
+impl<'a> TreeParams<'a> {
+    /// Set a sensible default period when switching to a TPMS surface.
+    fn set_tpms_defaults(&mut self, name: &str) {
+        self.tpms_period = match name {
+            "gyroid" => 4.0,
+            "fischer-koch-s" | "fischer-koch-y" => 2.0,
+            _ => 3.0,
+        };
+    }
+}
+
 /// Built-in implicit surfaces. Each name maps to a Fidget `Tree`.
-/// `gyroid-sphere` is the same gyroid expression — clipping to the
-/// unit ball happens post-mesh in `clip_mesh_to_ball`.
-fn build_tree(name: &str) -> fidget_core::context::Tree {
+fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
     use fidget_core::context::Tree as T;
-    // Helper for TPMS: returns x*k as Tree for a given period scale k.
-    let s = |k: f32| -> (T, T, T) { (T::x() * k, T::y() * k, T::z() * k) };
-    match name {
-        "sphere" => (T::x().square() + T::y().square() + T::z().square()).sqrt() - 0.8,
+    let k = p.tpms_period;
+    let s = move |f: f32| -> (T, T, T) { (T::x() * f, T::y() * f, T::z() * f) };
+    match p.name {
+        "sphere" => (T::x().square() + T::y().square() + T::z().square()).sqrt()
+          - p.sphere_radius,
         "torus" => {
-            let r = T::x().square() + T::y().square();
-            (r.sqrt() - 0.6).square() + T::z().square() - 0.2 * 0.2
+            let major = T::x().square() + T::y().square();
+            (major.sqrt() - p.torus_major_r).square() + T::z().square()
+          - p.torus_minor_r * p.torus_minor_r
         }
-        // Gyroid:        sin(x)cos(y) + sin(y)cos(z) + sin(z)cos(x) = 0
-        "gyroid" | "gyroid-sphere" => {
-            let (x, y, z) = s(4.0);
+        // Gyroid:        sin(kx)cos(ky) + sin(ky)cos(kz) + sin(kz)cos(kx) = 0
+        "gyroid" => {
+            let (x, y, z) = s(k);
             x.clone().sin() * y.clone().cos()
           + y.clone().sin() * z.clone().cos()
           + z.clone().sin() * x.clone().cos()
         }
-        // Schwarz P:     cos(x) + cos(y) + cos(z) = 0
+        // Schwarz P:     cos(kx) + cos(ky) + cos(kz) = 0
         "schwarz-p" => {
-            let (x, y, z) = s(3.0);
+            let (x, y, z) = s(k);
             x.cos() + y.cos() + z.cos()
         }
         // Schwarz D (Diamond):
-        //   sin(x)sin(y)sin(z) + sin(x)cos(y)cos(z)
-        // + cos(x)sin(y)cos(z) + cos(x)cos(y)sin(z) = 0
         "schwarz-d" => {
-            let (x, y, z) = s(3.0);
+            let (x, y, z) = s(k);
             let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
             let (cx, cy, cz) = (x.cos(), y.cos(), z.cos());
             sx.clone()*sy.clone()*sz.clone()
@@ -59,30 +78,90 @@ fn build_tree(name: &str) -> fidget_core::context::Tree {
           + cx*cy*sz
         }
         // Schoen IWP:
-        //   2[cos(x)cos(y) + cos(y)cos(z) + cos(z)cos(x)]
-        // - [cos(2x)+cos(2y)+cos(2z)] = 0
         "schoen-iwp" => {
-            let (x, y, z) = s(3.0);
+            let (x, y, z) = s(k);
             let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
             let (c2x, c2y, c2z) = ((x*2.0).cos(), (y*2.0).cos(), (z*2.0).cos());
             (cx.clone()*cy.clone() + cy*cz.clone() + cz*cx) * 2.0
           - (c2x + c2y + c2z)
         }
         // Neovius:
-        //   3[cos(x)+cos(y)+cos(z)] + 4 cos(x)cos(y)cos(z) = 0
         "neovius" => {
-            let (x, y, z) = s(3.0);
+            let (x, y, z) = s(k);
             let (cx, cy, cz) = (x.cos(), y.cos(), z.cos());
             (cx.clone() + cy.clone() + cz.clone()) * 3.0
           + cx*cy*cz * 4.0
         }
+        // Fischer-Koch F-RD (Schoen FRD):
+        "f-rd" => {
+            let (x, y, z) = s(k);
+            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
+            let (c2x, c2y, c2z) = ((x*2.0).cos(), (y*2.0).cos(), (z*2.0).cos());
+            cx*cy*cz * 4.0
+          - (c2x.clone()*c2y.clone() + c2y*c2z.clone() + c2z*c2x)
+        }
+        // Lidinoid — the only TPMS with an offset constant:
+        "lidinoid" => {
+            let (x, y, z) = s(k);
+            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
+            let (s2x, s2y, s2z) = ((x.clone()*2.0).sin(), (y.clone()*2.0).sin(), (z.clone()*2.0).sin());
+            let (c2x, c2y, c2z) = ((x*2.0).cos(), (y*2.0).cos(), (z*2.0).cos());
+            (s2x.clone()*cy.clone()*s2z.clone()
+           + s2y.clone()*cz.clone()*s2x.clone()
+           + s2z.clone()*cx.clone()*s2y.clone()) * 0.5
+          - (c2x.clone()*c2y.clone() + c2y*c2z.clone() + c2z*c2x) * 0.5
+          + 0.15
+        }
+        // Fischer-Koch S:
+        "fischer-koch-s" => {
+            let (x, y, z) = s(k);
+            let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
+            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
+            let (c2x, c2y, c2z) = ((x*2.0).cos(), (y*2.0).cos(), (z*2.0).cos());
+            c2x*sy.clone()*cz.clone()
+          + c2y*sz.clone()*cx.clone()
+          + c2z*sx*cy
+        }
+        // Fischer-Koch Y:
+        "fischer-koch-y" => {
+            let (x, y, z) = s(k);
+            let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
+            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
+            let (s2x, s2y, s2z) = ((x*2.0).sin(), (y*2.0).sin(), (z*2.0).sin());
+            cx*cy*cz * 2.0
+          + s2x*sy.clone() + s2y*sz.clone() + s2z*sx
+        }
+        // Fischer-Koch CP:
+        "fischer-koch-cp" => {
+            let (x, y, z) = s(k);
+            let (cx, cy, cz) = (x.cos(), y.cos(), z.cos());
+            cx.clone() + cy.clone() + cz.clone() + cx*cy*cz * 4.0
+        }
         _ => {
-            // Fallback: gyroid.
+            // Fallback: gyroid at k=4.
+            let s = move |f| -> (T, T, T) { (T::x() * f, T::y() * f, T::z() * f) };
             let (x, y, z) = s(4.0);
             x.clone().sin() * y.clone().cos()
           + y.clone().sin() * z.clone().cos()
           + z.clone().sin() * x.clone().cos()
         }
+    }
+}
+
+/// Human-readable formula for a TPMS surface (shown in the UI).
+fn tpms_formula(name: &str) -> &str {
+    match name {
+        "gyroid"          => "sin(kx)cos(ky) + sin(ky)cos(kz) + sin(kz)cos(kx) = 0",
+        "schwarz-p"       => "cos(kx) + cos(ky) + cos(kz) = 0",
+        "schwarz-d"       => "sin(kx)sin(ky)sin(kz) + sin(kx)cos(ky)cos(kz)\n  + cos(kx)sin(ky)cos(kz) + cos(kx)cos(ky)sin(kz) = 0",
+        "schoen-iwp"      => "2[cos(kx)cos(ky)+cos(ky)cos(kz)+cos(kz)cos(kx)]\n  − [cos(2kx)+cos(2ky)+cos(2kz)] = 0",
+        "neovius"         => "3[cos(kx)+cos(ky)+cos(kz)] + 4cos(kx)cos(ky)cos(kz) = 0",
+        "f-rd"            => "4cos(kx)cos(ky)cos(kz) − [cos(2kx)cos(2ky)\n  + cos(2ky)cos(2kz) + cos(2kz)cos(2kx)] = 0",
+        "lidinoid"        => "½[sin(2kx)cos(ky)sin(kz) + …]\n  − ½[cos(2kx)cos(2ky) + …] + 0.15 = 0",
+        "fischer-koch-s"  => "cos(2kx)sin(ky)cos(kz) + cos(2ky)sin(kz)cos(kx)\n  + cos(2kz)sin(kx)cos(ky) = 0",
+        "fischer-koch-y"  => "2cos(kx)cos(ky)cos(kz) + sin(2kx)sin(ky)\n  + sin(2ky)sin(kz) + sin(2kz)sin(kx) = 0",
+        "fischer-koch-cp" => "cos(kx)+cos(ky)+cos(kz) + 4cos(kx)cos(ky)cos(kz) = 0",
+        _ => "(unknown)",
     }
 }
 
@@ -172,13 +251,30 @@ fn build_mc33_mesh(tree: fidget_core::context::Tree, name: &str, res: usize) -> 
         }
     };
 
-    let (pos, idx) = marching_cubes::extract(
+    let (mut pos, idx) = marching_cubes::extract(
         f,
         (-1.0, 1.0, res),
         (-1.0, 1.0, res),
         (-1.0, 1.0, res),
     );
-    eprintln!("  [MC33] {} verts, {} tris (res={})", pos.len(), idx.len() / 3, res);
+    // Clamp all vertices to the sampling domain boundary.
+    // MC33 linearly interpolates across cell edges; when a boundary
+    // face carries a zero-crossing, the lerp factor can place the
+    // vertex fractionally outside [-1, 1]³ due to floating-point
+    // noise.  Without clamping, those vertices visually "overflow"
+    // the wireframe cube.
+    let mut out_of_bounds = 0usize;
+    for p in &mut pos {
+        for v in &mut *p {
+            if *v < -1.0 { *v = -1.0; out_of_bounds += 1; }
+            if *v >  1.0 { *v =  1.0; out_of_bounds += 1; }
+        }
+    }
+    if out_of_bounds > 0 {
+        eprintln!("  [MC33] clamped {} vertex coordinates to [-1,1]", out_of_bounds);
+    }
+    eprintln!("  [MC33] {} verts, {} tris (res={})",
+        pos.len(), idx.len() / 3, res);
 
     // MC33 winding fix via full pipeline.
     let mut tmp = Mesh::from_triangles("tmp", &pos, &idx);
@@ -462,17 +558,17 @@ fn build_mesh(
     depth: u8,
     mc_res: usize,
     clip_to_unit_ball: bool,
+    clip_radius: f32,
 ) -> Mesh {
     let mut mesh = match backend {
         MeshBackend::DualContouring => build_dc_mesh(tree, name, depth),
         MeshBackend::MarchingCubes33 => build_mc33_mesh(tree, name, mc_res),
     };
-    // Clip the open implicit surface to the unit ball when requested
-    // (used e.g. for `gyroid-sphere`-style display).
+    // Clip the open implicit surface to the ball when requested.
     if clip_to_unit_ball {
-        clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], 1.0);
-        eprintln!("  [clip] {} verts, {} tris after ball clip",
-            mesh.vertices.len(), mesh.indices.len() / 3);
+        clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], clip_radius);
+        eprintln!("  [clip] {} verts, {} tris after ball clip (r={})",
+            mesh.vertices.len(), mesh.indices.len() / 3, clip_radius);
         recompute_smooth_normals(&mut mesh);
     }
     mesh
@@ -779,23 +875,39 @@ enum SurfaceSource {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step { Source, Mesh, Display, Topology }
 
-const BUILTIN_SURFACES: &[(&str, &str)] = &[
-    ("sphere",        "Sphere   |x|=0.8"),
-    ("torus",         "Torus    R=0.6, r=0.2"),
-    ("gyroid",        "Gyroid   (TPMS)"),
-    ("gyroid-sphere", "Gyroid ∩ ball"),
-    ("schwarz-p",     "Schwarz P (TPMS)"),
-    ("schwarz-d",     "Schwarz D (TPMS)"),
-    ("schoen-iwp",    "Schoen IWP (TPMS)"),
-    ("neovius",       "Neovius (TPMS)"),
+const PRIMITIVE_SURFACES: &[(&str, &str)] = &[
+    ("sphere", "Sphere"),
+    ("torus",  "Torus"),
+];
+
+const TPMS_SURFACES: &[(&str, &str)] = &[
+    ("gyroid",        "Gyroid"),
+    ("schwarz-p",     "Schwarz P"),
+    ("schwarz-d",     "Schwarz D"),
+    ("schoen-iwp",    "Schoen IWP"),
+    ("neovius",       "Neovius"),
+    ("f-rd",          "F-RD (Schoen FRD)"),
+    ("lidinoid",      "Lidinoid"),
+    ("fischer-koch-s", "Fischer-Koch S"),
+    ("fischer-koch-y", "Fischer-Koch Y"),
+    ("fischer-koch-cp","Fischer-Koch CP"),
 ];
 
 struct App {
     // ── implicit surface source ──
     source: SurfaceSource,
+    /// The name currently shown in the TPMS combo-box.
+    selected_tpms: &'static str,
     custom_expr: String,
     custom_error: Option<String>,
     clip_to_unit_ball: bool,
+    clip_radius: f32,
+
+    // ── shape parameters (persisted across surface switches) ──
+    sphere_radius: f32,
+    torus_major_r: f32,
+    torus_minor_r: f32,
+    tpms_period: f32,
 
     // ── meshing ──
     mesh_backend: MeshBackend,
@@ -803,6 +915,18 @@ struct App {
     mc_res: usize,
     show_ms_loops: bool,
     show_bounding: bool,
+
+    // ── edge / vertex overlay (persisted across rebuilds) ──
+    show_surface_edges: bool,
+    edge_color: [f32; 3],
+    edge_line_width: f32,
+    // Bounding-wireframe appearance, independent of the surface-edge
+    // overlay above.  Applied as a per-node override in `build_scene`.
+    wireframe_color: [f32; 3],
+    wireframe_line_width: f32,
+
+    // ── surface appearance ──
+    surface_color: [f32; 3],
 
     // ── workflow / UI ──
     current_step: Step,
@@ -826,9 +950,26 @@ impl App {
         }
     }
 
+    fn tree_params(&self) -> TreeParams<'_> {
+        let name = match &self.source {
+            SurfaceSource::BuiltIn(n) => *n,
+            SurfaceSource::Custom => "custom",
+        };
+        TreeParams {
+            name,
+            sphere_radius: self.sphere_radius,
+            torus_major_r: self.torus_major_r,
+            torus_minor_r: self.torus_minor_r,
+            tpms_period: self.tpms_period,
+        }
+    }
+
     fn current_tree(&self) -> Result<fidget_core::context::Tree, String> {
         match &self.source {
-            SurfaceSource::BuiltIn(n) => Ok(build_tree(n)),
+            SurfaceSource::BuiltIn(_) => {
+                let p = self.tree_params();
+                Ok(build_tree(&p))
+            }
             SurfaceSource::Custom => build_tree_from_rhai(&self.custom_expr),
         }
     }
@@ -851,10 +992,29 @@ impl App {
         };
 
         let label = self.surface_label();
+        // Adaptive resolution: when the surface features are thinner
+        // than ~3 MC33 grid cells the mesh becomes degenerate.
+        // Bump the resolution automatically, capped at 512.
+        let effective_res = {
+            let min_feature = match &self.source {
+                // Torus tube diameter ≈ 2 * minor_r
+                SurfaceSource::BuiltIn("torus") => 2.0 * self.torus_minor_r,
+                // TPMS half-period ≈ π/k
+                SurfaceSource::BuiltIn(n)
+                    if TPMS_SURFACES.iter().any(|(k,_)| k == n) => std::f32::consts::PI / self.tpms_period,
+                _ => 0.5, // sphere & others are well-resolved even at res=16
+            };
+            let needed = ((6.0 / min_feature) as usize).max(self.mc_res).min(512);
+            if needed > self.mc_res {
+                eprintln!("  [MC33] auto-bump res {} -> {} (feature {:.3})",
+                    self.mc_res, needed, min_feature);
+            }
+            needed
+        };
         let mesh = build_mesh(
             tree.clone(), &label,
-            self.mesh_backend, self.surf_depth, self.mc_res,
-            self.clip_to_unit_ball,
+            self.mesh_backend, self.surf_depth, effective_res,
+            self.clip_to_unit_ball, self.clip_radius,
         );
         // Topology stats for the status bar.
         self.last_topology = Some(compute_topology(&mesh));
@@ -862,12 +1022,16 @@ impl App {
 
         let mat = PbrMaterial {
             name: "Surface".into(),
-            albedo: [0.2, 0.6, 0.9, 1.0],
+            albedo: [self.surface_color[0], self.surface_color[1], self.surface_color[2], 1.0],
             metallic: 0.6,
             roughness: 0.3,
             ..Default::default()
         };
         let mut scene = Scene::single_mesh(&label, mesh, mat);
+        // The surface node is index 0; toggle its triangle-edge overlay.
+        if let Some(n) = scene.nodes.first_mut() {
+            n.render_edges = self.show_surface_edges;
+        }
 
         if self.show_ms_loops {
             let shape = Shape::<VmFunction>::from(tree);
@@ -889,12 +1053,14 @@ impl App {
                 children: Vec::new(),
                 visible: true,
                 render_edges: false,
+                edge_color_override: None,
+                edge_width_override: None,
             });
         }
 
         if self.show_bounding {
             let wf_mesh = if self.clip_to_unit_ball {
-                build_sphere_wireframe(1.0, 12, 24)
+                build_sphere_wireframe(self.clip_radius, 12, 24)
             } else {
                 build_box_wireframe()
             };
@@ -909,6 +1075,8 @@ impl App {
                 children: Vec::new(),
                 visible: true,
                 render_edges: true,
+                edge_color_override: Some(self.wireframe_color),
+                edge_width_override: Some(self.wireframe_line_width),
             });
         }
 
@@ -933,6 +1101,10 @@ impl App {
             mesh, mat,
         );
         let _ = aabb; // (camera fit happens in caller via scene_dirty path)
+        let mut scene = scene;
+        if let Some(n) = scene.nodes.first_mut() {
+            n.render_edges = self.show_surface_edges;
+        }
         Ok(scene)
     }
 }
@@ -1016,10 +1188,12 @@ impl EngvisApp for App {
         }
 
         // ── Edge overlay enabled so the bounding box / sphere shows up;
-        //    only nodes with `render_edges=true` are affected.
+        //    only nodes with `render_edges=true` are affected.  Edge color
+        //    and line width come from the App (controlled in the
+        //    Display panel) so the user's choice persists across remeshes.
         frame.render_state.edge_opts.enabled = true;
-        frame.render_state.edge_opts.color = [0.9, 0.9, 0.9];
-        frame.render_state.edge_opts.line_width = 2.0;
+        frame.render_state.edge_opts.color = self.edge_color;
+        frame.render_state.edge_opts.line_width = self.edge_line_width;
         if !self.camera_fitted {
             frame.camera.fit_to_aabb(Aabb {
                 min: glam::Vec3::new(-1.0, -1.0, -1.0),
@@ -1159,18 +1333,80 @@ impl App {
         ui.label("Implicit surface f(x,y,z) = 0.");
         ui.add_space(6.0);
 
-        ui.label("Built-in surfaces:");
-        for (key, label) in BUILTIN_SURFACES {
+        // ── Primitive shapes ──────────────────────────────
+        ui.label("Primitive shapes:");
+        for (key, label) in PRIMITIVE_SURFACES {
             let selected = matches!(&self.source, SurfaceSource::BuiltIn(n) if n == key);
             if ui.selectable_label(selected, *label).clicked() {
                 self.source = SurfaceSource::BuiltIn(*key);
-                // gyroid-sphere implies a unit-ball clip.
-                self.clip_to_unit_ball = *key == "gyroid-sphere";
                 self.needs_remesh = true;
+            }
+            // Show parameters directly below the selected primitive
+            if selected {
+                ui.indent((*key, "params"), |ui| {
+                    match *key {
+                        "sphere" => {
+                            if ui.add(egui::Slider::new(&mut self.sphere_radius, 0.1..=3.0)
+                                .text("Radius")).changed() {
+                                self.needs_remesh = true;
+                            }
+                        }
+                        "torus" => {
+                            if ui.add(egui::Slider::new(&mut self.torus_major_r, 0.1..=3.0)
+                                .text("Major R")).changed() {
+                                self.needs_remesh = true;
+                            }
+                            if ui.add(egui::Slider::new(&mut self.torus_minor_r, 0.02..=1.5)
+                                .text("Minor r")).changed() {
+                                self.needs_remesh = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                });
             }
         }
 
-        ui.add_space(8.0);
+        ui.add_space(10.0);
+        // ── TPMS (dropdown) ───────────────────────────────
+        ui.label("Triply Periodic Minimal Surfaces:");
+        let prev_idx = TPMS_SURFACES.iter()
+            .position(|(k, _)| *k == self.selected_tpms)
+            .unwrap_or(0);
+        let mut tpms_idx = prev_idx;
+        egui::ComboBox::from_id_salt("tpms_combo")
+            .width(200.0)
+            .selected_text(TPMS_SURFACES[tpms_idx].1)
+            .show_ui(ui, |ui| {
+                for (i, (_key, label)) in TPMS_SURFACES.iter().enumerate() {
+                    ui.selectable_value(&mut tpms_idx, i, *label);
+                }
+            });
+        if tpms_idx != prev_idx {
+            self.selected_tpms = TPMS_SURFACES[tpms_idx].0;
+            self.source = SurfaceSource::BuiltIn(self.selected_tpms);
+            // Reset period to the surface's default
+            let mut p = self.tree_params();
+            p.set_tpms_defaults(self.selected_tpms);
+            self.tpms_period = p.tpms_period;
+            self.needs_remesh = true;
+        }
+        // Show formula + period slider when a TPMS is the active source
+        if matches!(&self.source, SurfaceSource::BuiltIn(n)
+            if TPMS_SURFACES.iter().any(|(k,_)| k == n))
+        {
+            ui.indent("tpms_opts", |ui| {
+                ui.label("Implicit equation:");
+                let formula = tpms_formula(self.selected_tpms);
+                ui.code(formula);
+                if ui.add(egui::Slider::new(&mut self.tpms_period, 0.5..=10.0)
+                    .text("Period k")).changed() {
+                    self.needs_remesh = true;
+                }
+            });
+        }
+
+        ui.add_space(10.0);
         ui.separator();
         ui.label("Custom expression (Rhai):");
         let resp = ui.add(egui::TextEdit::multiline(&mut self.custom_expr)
@@ -1192,9 +1428,17 @@ impl App {
 
         ui.add_space(8.0);
         ui.separator();
-        if ui.checkbox(&mut self.clip_to_unit_ball, "Clip to unit ball").changed() {
+        // ── Clip ──────────────────────────────────────────
+        ui.label("Bounding region:");
+        if ui.checkbox(&mut self.clip_to_unit_ball, "Clip to ball").changed() {
             self.needs_remesh = true;
         }
+        ui.indent("clip_opts", |ui| {
+            if ui.add(egui::Slider::new(&mut self.clip_radius, 0.2..=5.0)
+                .text("Clip radius")).changed() {
+                self.needs_remesh = true;
+            }
+        });
     }
 
     fn ui_mesh(&mut self, ui: &mut egui::Ui) {
@@ -1235,22 +1479,73 @@ impl App {
         render_state: &mut engvis_core::material::RenderState)
     {
         ui.heading("3. Display");
-        ui.checkbox(&mut render_state.show_surface, "Triangle surface");
-        ui.add(egui::Slider::new(&mut render_state.opacity, 0.0..=1.0).text("Opacity"));
-        ui.checkbox(&mut render_state.vertex_opts.enabled, "Show points");
-        if render_state.vertex_opts.enabled {
-            ui.add(egui::Slider::new(&mut render_state.vertex_opts.point_size, 1.0..=12.0)
-                .text("Point size"));
-            ui.horizontal(|ui| {
-                ui.label("Color");
-                ui.color_edit_button_rgb(&mut render_state.vertex_opts.color);
+
+        // ── Surface ────────────────────────────────────────
+        ui.checkbox(&mut render_state.show_surface, "Show triangle surface");
+        if render_state.show_surface {
+            ui.indent("surface_opts", |ui| {
+                if ui.horizontal(|ui| {
+                    ui.label("Color");
+                    ui.color_edit_button_rgb(&mut self.surface_color)
+                }).inner.changed() {
+                    self.needs_remesh = true;
+                }
+                ui.add(egui::Slider::new(&mut render_state.opacity, 0.0..=1.0)
+                    .text("Opacity"));
             });
         }
-        ui.checkbox(&mut render_state.show_grid, "World grid");
+
+        // ── Edges ──────────────────────────────────────────
+        // Triangle-mesh edges of the surface node — toggling this flag
+        // requires reapplying `render_edges` on the node, which happens
+        // on the next remesh.
+        if ui.checkbox(&mut self.show_surface_edges, "Show triangle edges").changed() {
+            self.needs_remesh = true;
+        }
+        if self.show_surface_edges {
+            ui.indent("edge_opts", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Color");
+                    ui.color_edit_button_rgb(&mut self.edge_color);
+                });
+                ui.add(egui::Slider::new(&mut self.edge_line_width, 0.5..=10.0)
+                    .text("Line width (px)"));
+            });
+        }
+
+        // ── Points ─────────────────────────────────────────
+        ui.checkbox(&mut render_state.vertex_opts.enabled, "Show points");
+        if render_state.vertex_opts.enabled {
+            ui.indent("point_opts", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Color");
+                    ui.color_edit_button_rgb(&mut render_state.vertex_opts.color);
+                });
+                ui.add(egui::Slider::new(&mut render_state.vertex_opts.point_size, 1.0..=12.0)
+                    .text("Point size"));
+            });
+        }
+
+        // ── Other overlays ─────────────────────────────────
         ui.add_space(6.0);
         ui.separator();
-        if ui.checkbox(&mut self.show_bounding, "Bounding wireframe").changed() {
+        ui.checkbox(&mut render_state.show_grid, "World grid");
+        if ui.checkbox(&mut self.show_bounding, "Show bounding wireframe").changed() {
             self.needs_remesh = true;
+        }
+        if self.show_bounding {
+            ui.indent("wireframe_opts", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Color");
+                    if ui.color_edit_button_rgb(&mut self.wireframe_color).changed() {
+                        self.needs_remesh = true;
+                    }
+                });
+                if ui.add(egui::Slider::new(&mut self.wireframe_line_width, 0.5..=10.0)
+                    .text("Line width (px)")).changed() {
+                    self.needs_remesh = true;
+                }
+            });
         }
         if ui.checkbox(&mut self.show_ms_loops, "MS boundary loops").changed() {
             self.needs_remesh = true;
@@ -1282,15 +1577,27 @@ impl App {
 fn main() {
     env_logger::init();
     engvis_renderer::run(App {
-        source: SurfaceSource::BuiltIn("gyroid-sphere"),
+        source: SurfaceSource::BuiltIn("gyroid"),
+        selected_tpms: "gyroid",
         custom_expr: "sin(4*x)*cos(4*y) + sin(4*y)*cos(4*z) + sin(4*z)*cos(4*x)".to_string(),
         custom_error: None,
-        clip_to_unit_ball: true,
+        clip_to_unit_ball: false,
+        clip_radius: 1.0,
+        sphere_radius: 0.8,
+        torus_major_r: 0.6,
+        torus_minor_r: 0.2,
+        tpms_period: 4.0,
         mesh_backend: MeshBackend::MarchingCubes33,
         surf_depth: 7,
         mc_res: 64,
         show_ms_loops: false,
         show_bounding: true,
+        show_surface_edges: false,
+        edge_color: [0.9, 0.9, 0.9],
+        edge_line_width: 2.0,
+        wireframe_color: [0.9, 0.9, 0.9],
+        wireframe_line_width: 2.0,
+        surface_color: [0.2, 0.6, 0.9],
         current_step: Step::Source,
         pending_load: None,
         pending_save: None,

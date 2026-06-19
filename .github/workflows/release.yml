@@ -8,11 +8,23 @@ on:
 permissions:
   contents: write
 
+# Use the sparse registry protocol so each crate is fetched as an
+# individual HTTPS request rather than via a single huge git clone of
+# the index.  This is far more resilient to transient network issues
+# on Windows runners (which occasionally fail with "Connection was
+# reset" while pulling crates.io).
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: "sparse"
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
@@ -32,12 +44,26 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Install Linux deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
 
+      - name: Fetch dependencies (with retry)
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5; do
+            cargo fetch --target ${{ matrix.target }} && break
+            echo "cargo fetch failed (attempt $i), sleeping 15s..."
+            sleep 15
+          done
+
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --offline --target ${{ matrix.target }}
 
       - name: Strip (non-Windows)
         if: runner.os != 'Windows'

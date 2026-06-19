@@ -16,6 +16,12 @@ pub struct SceneNode {
     /// Used for wireframe bounding boxes / outlines that should not
     /// light up every triangle edge of the surface mesh.
     pub render_edges: bool,
+    /// Optional per-node override for the edge-overlay color.
+    /// `None` falls back to the global `RenderState::edge_opts.color`.
+    pub edge_color_override: Option<[f32; 3]>,
+    /// Optional per-node override for the edge-overlay line width.
+    /// `None` falls back to the global `RenderState::edge_opts.line_width`.
+    pub edge_width_override: Option<f32>,
 }
 
 /// The top-level scene containing all data
@@ -57,6 +63,8 @@ impl Scene {
                 children: Vec::new(),
                 visible: true,
                 render_edges: false,
+                edge_color_override: None,
+                edge_width_override: None,
             }],
             lighting: LightingEnvironment::default(),
         }

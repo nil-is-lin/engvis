@@ -257,6 +257,8 @@ pub fn load_gltf(
             children: node.children().map(|child| load_node(&child)).collect(),
             visible: true,
             render_edges: false,
+            edge_color_override: None,
+            edge_width_override: None,
         }
     }
 
