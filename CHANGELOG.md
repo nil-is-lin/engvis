@@ -22,6 +22,13 @@ All notable changes to this project will be documented in this file.
 - Grid not visible through transparent surface due to rendering order.
 - Edge overlay using hardcoded color instead of user-selected color.
 
+## [0.1.3] - 2026-06-19
+
+### Changed
+
+- Release assets: each platform now uploads the raw binary alongside the
+  compressed archive (`.tar.gz`/`.zip`).
+
 ## [0.1.2] - 2026-06-19
 
 ### Added
