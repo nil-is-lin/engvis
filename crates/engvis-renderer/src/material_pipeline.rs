@@ -385,9 +385,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Normal mapping
     let sampled_normal = textureSample(normal_tex, mat_sampler, in.uv).xyz * 2.0 - 1.0;
-    let T = normalize(in.world_tangent);
-    let B = normalize(in.world_bitangent);
     let Ng = normalize(in.world_normal);
+    // Gram-Schmidt orthogonalise the tangent against the normal.  When the
+    // mesh tangent is parallel to the normal (e.g. axis-aligned box-cap
+    // faces whose normal is ±X and whose constant tangent is also X), the
+    // raw cross products collapse to zero and the TBN matrix becomes
+    // singular, producing NaN normals and pitch-black faces.  Re-deriving
+    // T (and a fallback when T is parallel to Ng) keeps TBN well-formed.
+    var T = in.world_tangent - Ng * dot(Ng, in.world_tangent);
+    if (dot(T, T) < 1e-8) {
+        // Tangent parallel to normal: pick any vector not parallel to Ng.
+        let helper = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(Ng.x) > 0.9);
+        T = helper - Ng * dot(Ng, helper);
+    }
+    T = normalize(T);
+    let B = normalize(cross(Ng, T));
     let TBN = mat3x3<f32>(T, B, Ng);
     var N = normalize(TBN * (sampled_normal * vec3<f32>(material.normal_scale, material.normal_scale, 1.0)));
 

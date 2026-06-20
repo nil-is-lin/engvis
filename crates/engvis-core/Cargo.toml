@@ -13,3 +13,4 @@ repository = "https://github.com/nil-is-lin/engvis"
 [dependencies]
 glam.workspace = true
 bytemuck.workspace = true
+rayon.workspace = true

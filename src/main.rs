@@ -42,6 +42,21 @@ impl<'a> TreeParams<'a> {
     }
 }
 
+/// Morphology mode for TPMS surfaces.
+///
+/// * **MinimalSurface** — direct iso-surface $f(\mathbf{x})=0$ (the classic open sheet).
+/// * **Shell** — two offset surfaces $f^2 - (t'/2)^2 = 0$ producing a hollow wall.
+/// * **Skeletal** — shifted iso-level $f - C = 0$ producing a solid strut network.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Morphology {
+    /// Classic open surface f = 0.
+    MinimalSurface,
+    /// Thick shell: f² − (t/2)² = 0.
+    Shell,
+    /// Solid skeletal network: f − C = 0.
+    Skeletal,
+}
+
 /// Built-in implicit surfaces. Each name maps to a Fidget `Tree`.
 fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
     use fidget_core::context::Tree as T;
@@ -112,6 +127,19 @@ fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
           - (c2x.clone()*c2y.clone() + c2y*c2z.clone() + c2z*c2x) * 0.5
           + 0.15
         }
+        // Split-P — a TPMS with P-surface symmetry:
+        "split-p" => {
+            let (x, y, z) = s(k);
+            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
+            let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
+            let (s2x, s2y, s2z) = ((x.clone()*2.0).sin(), (y.clone()*2.0).sin(), (z.clone()*2.0).sin());
+            let (c2x, c2y, c2z) = ((x*2.0).cos(), (y*2.0).cos(), (z*2.0).cos());
+            (s2x.clone()*cy.clone()*sz.clone()
+           + sx.clone()*s2y.clone()*cz.clone()
+           + cx.clone()*sy.clone()*s2z.clone()) * 1.1
+          - (c2x.clone()*c2y.clone() + c2y.clone()*c2z.clone() + c2z.clone()*c2x.clone()) * 0.2
+          - (c2x + c2y + c2z) * 0.4
+        }
         // Fischer-Koch S:
         "fischer-koch-s" => {
             let (x, y, z) = s(k);
@@ -158,6 +186,7 @@ fn tpms_formula(name: &str) -> &str {
         "neovius"         => "3[cos(kx)+cos(ky)+cos(kz)] + 4cos(kx)cos(ky)cos(kz) = 0",
         "f-rd"            => "4cos(kx)cos(ky)cos(kz) − [cos(2kx)cos(2ky)\n  + cos(2ky)cos(2kz) + cos(2kz)cos(2kx)] = 0",
         "lidinoid"        => "½[sin(2kx)cos(ky)sin(kz) + …]\n  − ½[cos(2kx)cos(2ky) + …] + 0.15 = 0",
+        "split-p"         => "1.1[sin(2kx)cos(ky)sin(kz) + …]\n  − 0.2[cos(2kx)cos(2ky) + …]\n  − 0.4[cos(2kx)+cos(2ky)+cos(2kz)] = 0",
         "fischer-koch-s"  => "cos(2kx)sin(ky)cos(kz) + cos(2ky)sin(kz)cos(kx)\n  + cos(2kz)sin(kx)cos(ky) = 0",
         "fischer-koch-y"  => "2cos(kx)cos(ky)cos(kz) + sin(2kx)sin(ky)\n  + sin(2ky)sin(kz) + sin(2kz)sin(kx) = 0",
         "fischer-koch-cp" => "cos(kx)+cos(ky)+cos(kz) + 4cos(kx)cos(ky)cos(kz) = 0",
@@ -174,6 +203,55 @@ fn build_tree_from_rhai(src: &str) -> Result<fidget_core::context::Tree, String>
         .eval(src)
         .map_err(|e| format!("{e}"))?;
     Ok(tree)
+}
+
+// =====================================================================
+// Diagnostic: classify boundary edges as on-box-face or interior.
+// =====================================================================
+
+/// Analyse boundary edges of a mesh in [-1,1]³ and classify them as:
+///   - **box-face**: both endpoints lie on the same face of [-1,1]³
+///   - **interior**: at least one endpoint is strictly inside the box
+#[allow(dead_code)]
+fn classify_boundary_edges(mesh: &Mesh, tag: &str) {
+    use std::collections::HashMap;
+    let v = mesh.vertices.len();
+    let f = mesh.indices.len() / 3;
+
+    // edge → face count
+    let mut edge_faces: HashMap<(u32, u32), usize> = HashMap::with_capacity(f * 3);
+    for tri in mesh.indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0], tri[1], tri[2]);
+        for &(i0, i1) in &[(a, b), (b, c), (c, a)] {
+            let key = if i0 <= i1 { (i0, i1) } else { (i1, i0) };
+            *edge_faces.entry(key).or_default() += 1;
+        }
+    }
+
+    let tol = 0.02; // tolerance for "on box face"
+    let mut on_box_face = 0usize;
+    let mut interior = 0usize;
+
+    for &(a, b) in edge_faces.keys() {
+        if edge_faces[&(a, b)] != 1 { continue; }
+        let pa = mesh.vertices[a as usize].position;
+        let pb = mesh.vertices[b as usize].position;
+        let on_face = |p: [f32; 3]| -> bool {
+            p[0].abs() > 1.0 - tol || p[1].abs() > 1.0 - tol || p[2].abs() > 1.0 - tol
+        };
+        if on_face(pa) && on_face(pb) {
+            on_box_face += 1;
+        } else {
+            interior += 1;
+        }
+    }
+
+    let topo = compute_topology(mesh);
+    eprintln!(
+        "  [diag:{tag}] V={} F={} χ={} components={} | boundary_edges: {} on_box_face, {} interior | non_manifold={}",
+        v, f, topo.euler, topo.connected_components,
+        on_box_face, interior, topo.non_manifold_edges,
+    );
 }
 
 // =====================================================================
@@ -232,58 +310,80 @@ fn build_dc_mesh(tree: fidget_core::context::Tree, name: &str, depth: u8) -> Mes
 // 2b. Marching Cubes 33 — boundary naturally smooth
 // =====================================================================
 
-fn build_mc33_mesh(tree: fidget_core::context::Tree, name: &str, res: usize) -> Mesh {
+fn build_mc33_mesh(tree: fidget_core::context::Tree, name: &str, res: usize, skip_winding_fix: bool) -> Mesh {
+    build_mc33_mesh_domain(tree, name, res, skip_winding_fix, 1.0)
+}
+
+/// Like [`build_mc33_mesh`] but samples the cube `[-half, half]³`.
+///
+/// A `half > 1` pads the domain so that a field which has been
+/// CSG-intersected with the unit box (positive outside `[-1,1]³`)
+/// produces a *sign change at the box faces*.  Marching Cubes then
+/// generates the cap triangles itself, yielding a watertight mesh
+/// without any fragile boundary-loop reconstruction.
+fn build_mc33_mesh_domain(
+    tree: fidget_core::context::Tree,
+    name: &str,
+    res: usize,
+    skip_winding_fix: bool,
+    half: f32,
+) -> Mesh {
     use fidget_core::shape::Shape;
     use fidget_core::vm::VmFunction;
 
     let shape = Shape::<VmFunction>::from(tree);
 
-    // Float evaluator for MC33 grid sampling.
-    let mut float_eval = Shape::<VmFunction>::new_float_slice_eval();
+    // Scale resolution with the padded domain so cell size stays ~constant.
+    let res = ((res as f32) * half).ceil() as usize;
+
+    // Field evaluator: bulk-sampled internally by extract_par via a
+    // per-point closure backed by fidget's float-slice tape.
     let float_tape = shape.float_slice_tape(Default::default());
-    let f = |x: f32, y: f32, z: f32| -> f32 {
-        let xs = [x];
-        let ys = [y];
-        let zs = [z];
-        match float_eval.eval(&float_tape, &xs, &ys, &zs) {
-            Ok(r) => r[0],
-            Err(_) => 1e9,
+    let point_eval = {
+        let tape = float_tape.clone();
+        move |x: f32, y: f32, z: f32| -> f32 {
+            let mut eval = Shape::<VmFunction>::new_float_slice_eval();
+            match eval.eval(&tape, &[x], &[y], &[z]) {
+                Ok(r) => r[0],
+                Err(_) => 1e9,
+            }
         }
     };
 
-    let (mut pos, idx) = marching_cubes::extract(
-        f,
-        (-1.0, 1.0, res),
-        (-1.0, 1.0, res),
-        (-1.0, 1.0, res),
+    let (mut pos, idx) = marching_cubes::extract_par(
+        point_eval,
+        (-half, half, res),
+        (-half, half, res),
+        (-half, half, res),
     );
-    // Clamp all vertices to the sampling domain boundary.
-    // MC33 linearly interpolates across cell edges; when a boundary
-    // face carries a zero-crossing, the lerp factor can place the
-    // vertex fractionally outside [-1, 1]³ due to floating-point
-    // noise.  Without clamping, those vertices visually "overflow"
-    // the wireframe cube.
-    let mut out_of_bounds = 0usize;
-    for p in &mut pos {
-        for v in &mut *p {
-            if *v < -1.0 { *v = -1.0; out_of_bounds += 1; }
-            if *v >  1.0 { *v =  1.0; out_of_bounds += 1; }
+    // Only the non-padded path (half == 1) clamps stray vertices back to
+    // the sampling box.  For padded box-CSG solids the surface closes a
+    // little outside [-1,1]; clamping there would collapse distinct
+    // vertices and create non-manifold edges, so we leave them as-is.
+    if (half - 1.0).abs() < 1e-6 {
+        let mut out_of_bounds = 0usize;
+        for p in &mut pos {
+            for v in &mut *p {
+                if *v < -1.0 { *v = -1.0; out_of_bounds += 1; }
+                if *v >  1.0 { *v =  1.0; out_of_bounds += 1; }
+            }
         }
-    }
-    if out_of_bounds > 0 {
-        eprintln!("  [MC33] clamped {} vertex coordinates to [-1,1]", out_of_bounds);
+        if out_of_bounds > 0 {
+            eprintln!("  [MC33] clamped {} vertex coordinates to [-1,1]", out_of_bounds);
+        }
     }
     eprintln!("  [MC33] {} verts, {} tris (res={})",
         pos.len(), idx.len() / 3, res);
 
-    // MC33 winding fix via full pipeline.
-    let mut tmp = Mesh::from_triangles("tmp", &pos, &idx);
-    tmp.fix_winding();
-    eprintln!("  [MC33] winding fix applied");
-
-    let mut mesh = Mesh::from_triangles_open(name,
-        &tmp.vertices.iter().map(|v| v.position).collect::<Vec<_>>(),
-        &tmp.indices);
+    let mut mesh = if skip_winding_fix {
+        Mesh::from_triangles_open(name, &pos, &idx)
+    } else {
+        // extract_par already applied a gradient-based winding fix, so we
+        // only need from_triangles for vertex deduplication (adjacent MC
+        // cells emit duplicate edge vertices).  from_triangles also runs
+        // a neighbour-consistency winding pass, which is complementary.
+        Mesh::from_triangles(name, &pos, &idx)
+    };
     overwrite_normals_with_gradient(&shape, &mut mesh);
     mesh
 }
@@ -551,6 +651,56 @@ fn clip_mesh_to_ball(mesh: &mut Mesh, c: [f32; 3], r: f32) {
     }
 }
 
+/// Build a TPMS shell mesh: the thin solid wall `{ |f| ≤ half_t }`.
+///
+/// The shell is a thin band straddling the minimal surface `f = 0`,
+/// bounded by two iso-surfaces `f = ±half_t`.  Its solid region is
+/// described by the **smooth** field `g = f² − half_t²`, which is
+/// negative *inside* the wall and positive outside.  Unlike
+/// `|f| − half_t`, `f²` has no C¹ cusp at `f = 0`, so standard
+/// Marching Cubes stitches adjacent cells without fragmentation —
+/// provided the cell size is smaller than the wall thickness.
+///
+/// The field is CSG-intersected with the unit-box solid so MC
+/// generates cap faces on `x/y/z = ±1`, yielding a watertight wall.
+fn build_shell_mesh(
+    tree: fidget_core::context::Tree,
+    half_t: f32,
+    name: &str,
+    res: usize,
+    clip_to_unit_ball: bool,
+    clip_radius: f32,
+) -> Mesh {
+    use fidget_core::context::Tree as T;
+
+    // Box-CSG: intersect with unit-box solid so MC generates cap faces.
+    let half = 1.0 + 4.0 / res as f32;
+    let cell = 2.0 * half / (res as f32 * half).ceil();
+    let c = 1.0 - 0.5 * cell;
+    let box_sdf = T::x().abs().max(T::y().abs()).max(T::z().abs()) - c;
+
+    // Thin-wall solid: g = f² − half_t² (smooth, no cusp), then
+    // CSG-intersect with the box.
+    let wall = tree.square() - half_t * half_t;
+    let field = wall.max(box_sdf);
+    let mut mesh = build_mc33_mesh_domain(field, name, res, false, half);
+
+    if clip_to_unit_ball {
+        clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], clip_radius);
+        eprintln!("  [clip] {} verts, {} tris after ball clip (r={})",
+            mesh.vertices.len(), mesh.indices.len() / 3, clip_radius);
+        recompute_smooth_normals(&mut mesh);
+    }
+
+    let topo = engvis_core::topology::compute_topology(&mesh);
+    eprintln!(
+        "  [shell] V={} F={} | χ={} boundary_edges={} components={} watertight={}",
+        mesh.vertices.len(), mesh.indices.len() / 3,
+        topo.euler, topo.boundary_edges, topo.connected_components, topo.is_watertight,
+    );
+    mesh
+}
+
 fn build_mesh(
     tree: fidget_core::context::Tree,
     name: &str,
@@ -559,17 +709,47 @@ fn build_mesh(
     mc_res: usize,
     clip_to_unit_ball: bool,
     clip_radius: f32,
+    morphology: Morphology,
 ) -> Mesh {
-    let mut mesh = match backend {
-        MeshBackend::DualContouring => build_dc_mesh(tree, name, depth),
-        MeshBackend::MarchingCubes33 => build_mc33_mesh(tree, name, mc_res),
+    // Skeletal mode must produce a *closed solid*.  Rather than
+    // reconstruct boundary loops after meshing (fragile, leaves holes),
+    // we CSG-intersect the field with the unit-box solid and mesh over a
+    // slightly padded domain.  Marching Cubes then generates the cap
+    // faces on x/y/z = ±1 itself, giving a watertight mesh.
+    // Shell mode is handled separately by build_shell_mesh (dual-iso).
+    let is_solid = matches!(morphology, Morphology::Skeletal);
+    let mesh = if is_solid {
+        use fidget_core::context::Tree as T;
+        let half = 1.0 + 4.0 / mc_res as f32;
+        let cell = 2.0 * half / (mc_res as f32 * half).ceil();
+        let c = 1.0 - 0.5 * cell;
+        let box_sdf = T::x().abs().max(T::y().abs()).max(T::z().abs()) - c;
+        let clipped = tree.clone().max(box_sdf);
+        match backend {
+            MeshBackend::DualContouring => build_dc_mesh(clipped, name, depth),
+            MeshBackend::MarchingCubes33 =>
+                build_mc33_mesh_domain(clipped, name, mc_res, false, half),
+        }
+    } else {
+        match backend {
+            MeshBackend::DualContouring => build_dc_mesh(tree.clone(), name, depth),
+            MeshBackend::MarchingCubes33 => build_mc33_mesh(tree.clone(), name, mc_res, false),
+        }
     };
-    // Clip the open implicit surface to the ball when requested.
+    let mut mesh = mesh;
     if clip_to_unit_ball {
         clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], clip_radius);
         eprintln!("  [clip] {} verts, {} tris after ball clip (r={})",
             mesh.vertices.len(), mesh.indices.len() / 3, clip_radius);
         recompute_smooth_normals(&mut mesh);
+    }
+    if is_solid {
+        let topo = engvis_core::topology::compute_topology(&mesh);
+        eprintln!(
+            "  [solid] V={} F={} | χ={} boundary_edges={} components={} watertight={}",
+            mesh.vertices.len(), mesh.indices.len() / 3,
+            topo.euler, topo.boundary_edges, topo.connected_components, topo.is_watertight,
+        );
     }
     mesh
 }
@@ -888,6 +1068,7 @@ const TPMS_SURFACES: &[(&str, &str)] = &[
     ("neovius",       "Neovius"),
     ("f-rd",          "F-RD (Schoen FRD)"),
     ("lidinoid",      "Lidinoid"),
+    ("split-p",       "Split-P"),
     ("fischer-koch-s", "Fischer-Koch S"),
     ("fischer-koch-y", "Fischer-Koch Y"),
     ("fischer-koch-cp","Fischer-Koch CP"),
@@ -908,6 +1089,9 @@ struct App {
     torus_major_r: f32,
     torus_minor_r: f32,
     tpms_period: f32,
+    tpms_thickness: f32,
+    tpms_iso_level: f32,
+    morphology: Morphology,
 
     // ── meshing ──
     mesh_backend: MeshBackend,
@@ -992,11 +1176,43 @@ impl App {
         };
 
         let label = self.surface_label();
+
+        // Shell half-thickness in *field* units.  The user-facing
+        // `tpms_thickness` is a true *geometric* wall thickness (the
+        // physical distance across the wall).  A TPMS f(kx,ky,kz) has
+        // |∇f| ≈ k near its surface, so a geometric half-thickness `d`
+        // corresponds to a field offset `half_t = d · |∇f| ≈ d · k`.
+        // We therefore convert: half_t = (thickness/2) · k.
+        // For non-TPMS surfaces |∇f| ≈ 1, so k falls back to 1.
+        let shell_grad = if matches!(&self.source,
+            SurfaceSource::BuiltIn(n) if TPMS_SURFACES.iter().any(|(k,_)| k == n))
+        {
+            self.tpms_period.max(1.0)
+        } else {
+            1.0
+        };
+        let shell_half_t = if matches!(self.morphology, Morphology::Shell) {
+            0.5 * self.tpms_thickness * shell_grad
+        } else {
+            0.0
+        };
+
+        // Apply morphology transformation for TPMS surfaces.
+        // Shell:    handled separately via build_shell_mesh (smooth
+        //           f²−half_t² solid wall), so the tree stays
+        //           untransformed here.
+        // Skeletal: f − C = 0 → shifted iso-level forming solid strut network.
+        let tree = match self.morphology {
+            Morphology::MinimalSurface | Morphology::Shell => tree,
+            Morphology::Skeletal => {
+                tree.clone() - self.tpms_iso_level
+            }
+        };
         // Adaptive resolution: when the surface features are thinner
         // than ~3 MC33 grid cells the mesh becomes degenerate.
         // Bump the resolution automatically, capped at 512.
         let effective_res = {
-            let min_feature = match &self.source {
+            let mut min_feature = match &self.source {
                 // Torus tube diameter ≈ 2 * minor_r
                 SurfaceSource::BuiltIn("torus") => 2.0 * self.torus_minor_r,
                 // TPMS half-period ≈ π/k
@@ -1004,18 +1220,46 @@ impl App {
                     if TPMS_SURFACES.iter().any(|(k,_)| k == n) => std::f32::consts::PI / self.tpms_period,
                 _ => 0.5, // sphere & others are well-resolved even at res=16
             };
-            let needed = ((6.0 / min_feature) as usize).max(self.mc_res).min(512);
+            // Shell wall *geometric* thickness = 2·half_t/|∇f| =
+            // tpms_thickness (by construction of shell_half_t above).
+            // MC cannot resolve a wall thinner than ~1 grid cell, so the
+            // wall thickness becomes the limiting feature.
+            if matches!(self.morphology, Morphology::Shell) {
+                let wall = self.tpms_thickness; // geometric, by construction
+                if wall < min_feature {
+                    min_feature = wall;
+                }
+            }
+            // Shell needs cell < ~wall/10 to mesh the f²−half_t² band
+            // cleanly (the wall is pierced on both sides), so it uses a
+            // higher coefficient and floor than minimal/skeletal modes.
+            let coeff = if matches!(self.morphology, Morphology::Shell) { 10.0 } else { 6.0 };
+            let mut needed = ((coeff / min_feature) as usize).max(self.mc_res).min(512);
+            // Shell/Skeletal need a resolution floor for thin walls.
+            if matches!(self.morphology, Morphology::Shell) {
+                needed = needed.max(96);
+            } else if matches!(self.morphology, Morphology::Skeletal) {
+                needed = needed.max(64);
+            }
             if needed > self.mc_res {
                 eprintln!("  [MC33] auto-bump res {} -> {} (feature {:.3})",
                     self.mc_res, needed, min_feature);
             }
             needed
         };
-        let mesh = build_mesh(
-            tree.clone(), &label,
-            self.mesh_backend, self.surf_depth, effective_res,
-            self.clip_to_unit_ball, self.clip_radius,
-        );
+        let mesh = if matches!(self.morphology, Morphology::Shell) {
+            build_shell_mesh(
+                tree.clone(), shell_half_t, &label, effective_res,
+                self.clip_to_unit_ball, self.clip_radius,
+            )
+        } else {
+            build_mesh(
+                tree.clone(), &label,
+                self.mesh_backend, self.surf_depth, effective_res,
+                self.clip_to_unit_ball, self.clip_radius,
+                self.morphology,
+            )
+        };
         // Topology stats for the status bar.
         self.last_topology = Some(compute_topology(&mesh));
         self.last_build_ok = true;
@@ -1282,6 +1526,12 @@ impl EngvisApp for App {
                 }));
                 ui.separator();
                 ui.label(format!("surface: {}", self.surface_label()));
+                ui.separator();
+                ui.label(format!("mode: {}", match self.morphology {
+                    Morphology::MinimalSurface => "minimal",
+                    Morphology::Shell => "shell",
+                    Morphology::Skeletal => "skeletal",
+                }));
             });
         });
 
@@ -1402,6 +1652,39 @@ impl App {
                 if ui.add(egui::Slider::new(&mut self.tpms_period, 0.5..=10.0)
                     .text("Period k")).changed() {
                     self.needs_remesh = true;
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label("Morphology:");
+                let mut morph = self.morphology;
+                if ui.radio_value(&mut morph, Morphology::MinimalSurface,
+                    "Minimal surface  (f = 0)").changed() {
+                    self.morphology = morph; self.needs_remesh = true;
+                }
+                if ui.radio_value(&mut morph, Morphology::Shell,
+                    "Shell  (f² − (t/2)² = 0)").changed() {
+                    self.morphology = morph; self.needs_remesh = true;
+                }
+                if ui.radio_value(&mut morph, Morphology::Skeletal,
+                    "Skeletal  (f − C = 0)").changed() {
+                    self.morphology = morph; self.needs_remesh = true;
+                }
+                match self.morphology {
+                    Morphology::Shell => {
+                        if ui.add(egui::Slider::new(&mut self.tpms_thickness,
+                            0.02..=0.5).text("Wall thickness")).changed() {
+                            self.needs_remesh = true;
+                        }
+                        ui.label(format!(
+                            "  geometric wall thickness = {:.3}", self.tpms_thickness));
+                    }
+                    Morphology::Skeletal => {
+                        if ui.add(egui::Slider::new(&mut self.tpms_iso_level,
+                            -1.0..=2.0).text("C value")).changed() {
+                            self.needs_remesh = true;
+                        }
+                    }
+                    Morphology::MinimalSurface => {}
                 }
             });
         }
@@ -1576,6 +1859,32 @@ impl App {
 
 fn main() {
     env_logger::init();
+
+    if std::env::args().any(|a| a == "--selftest") {
+        // Test thin-wall shell meshing (smooth g = f²−half_t², box-CSG).
+        // Geometric thickness 0.1 → half_t = 0.5·0.1·k (k = period).
+        eprintln!("--- thin-wall shell mesh (build_shell_mesh) ---");
+        let p = TreeParams { name: "gyroid", sphere_radius: 0.8,
+            torus_major_r: 0.6, torus_minor_r: 0.2, tpms_period: 4.0 };
+        let tree = build_tree(&p);
+        let thickness = 0.1_f32;
+        let half_t = 0.5 * thickness * p.tpms_period;
+        eprintln!("  thickness(geom) = {}  half_t(field) = {}", thickness, half_t);
+        for &res in &[64usize, 96, 128] {
+            let mesh = build_shell_mesh(
+                tree.clone(), half_t, "shell-test", res,
+                false, 1.0,
+            );
+            let topo = engvis_core::topology::compute_topology(&mesh);
+            eprintln!(
+                "  res={} shell: V={} F={} | χ={} boundary_edges={} components={} watertight={}",
+                res, mesh.vertices.len(), mesh.indices.len() / 3,
+                topo.euler, topo.boundary_edges, topo.connected_components, topo.is_watertight,
+            );
+        }
+        return;
+    }
+
     engvis_renderer::run(App {
         source: SurfaceSource::BuiltIn("gyroid"),
         selected_tpms: "gyroid",
@@ -1587,6 +1896,9 @@ fn main() {
         torus_major_r: 0.6,
         torus_minor_r: 0.2,
         tpms_period: 4.0,
+        tpms_thickness: 0.1,
+        tpms_iso_level: 0.5,
+        morphology: Morphology::MinimalSurface,
         mesh_backend: MeshBackend::MarchingCubes33,
         surf_depth: 7,
         mc_res: 64,

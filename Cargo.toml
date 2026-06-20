@@ -61,4 +61,5 @@ tobj = "4.0"
 stl_io = "0.8"
 ply-rs-bw = "2.0"
 rfd = "0.15"
+rayon = "1.10"
 splines = { version = "4.4", features = ["glam"] }

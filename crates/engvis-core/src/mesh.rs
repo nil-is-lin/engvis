@@ -338,6 +338,25 @@ impl Mesh {
         let mut positions = positions.to_vec();
         let mut indices = indices.to_vec();
 
+        // Defensive: drop triangles referencing any non-finite vertex.
+        // A single inf/NaN position (e.g. from a degenerate marching-cubes
+        // edge interpolation) would otherwise make the AABB diagonal inf,
+        // inflate the dedup epsilon to inf, and collapse the entire mesh.
+        let finite = |p: &[f32; 3]| p[0].is_finite() && p[1].is_finite() && p[2].is_finite();
+        if positions.iter().any(|p| !finite(p)) {
+            let before = indices.len() / 3;
+            indices = indices
+                .chunks_exact(3)
+                .filter(|t| t.iter().all(|&i| finite(&positions[i as usize])))
+                .flatten()
+                .copied()
+                .collect();
+            eprintln!(
+                "  sanitize: dropped {} triangles with non-finite vertices",
+                before - indices.len() / 3
+            );
+        }
+
         // Dedup tolerance scaled to mesh size: 1e-6 of the AABB diagonal.
         // A fixed eps (e.g. 1e-4) over-merges vertices on high-resolution
         // meshes, creating non-manifold edges and winding inconsistencies
@@ -346,6 +365,7 @@ impl Mesh {
             let mut min = [f32::INFINITY; 3];
             let mut max = [f32::NEG_INFINITY; 3];
             for p in &positions {
+                if !finite(p) { continue; }
                 for i in 0..3 {
                     min[i] = min[i].min(p[i]);
                     max[i] = max[i].max(p[i]);

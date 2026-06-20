@@ -11,7 +11,20 @@
 use crate::bourke_table::TRI_TABLE;
 
 fn lerp(a: [f32; 3], b: [f32; 3], va: f32, vb: f32) -> [f32; 3] {
-    let t = va / (va - vb);
+    // Guard against a zero denominator: when the two endpoint field
+    // values are (nearly) equal, va/(va-vb) blows up to ±inf/NaN and
+    // poisons the whole mesh.  This happens on creases of CSG fields
+    // such as the TPMS shell |f|−t/2, where adjacent samples can be
+    // numerically identical.  Fall back to the edge midpoint.
+    let denom = va - vb;
+    let t = if denom.abs() < 1e-12 { 0.5 } else { va / denom };
+    // Clamp t to [0,1].  MC33 alternative triangulation tables can
+    // reference an edge whose endpoints are same-sign (the edge is not
+    // in EDGE_TABLE for this case); the raw t then falls outside [0,1]
+    // and the vertex escapes the cell, producing triangles that span
+    // outside the sampling box.  Clamping keeps the vertex on the edge
+    // segment, which is the closest valid point.
+    let t = t.clamp(0.0, 1.0);
     [
         a[0] + t * (b[0] - a[0]),
         a[1] + t * (b[1] - a[1]),
@@ -139,6 +152,52 @@ fn mc33_tris(case_idx: u8, subcase: u8, amb_faces: u8) -> &'static [i8] {
 /// The domain is [x0, x1] × [y0, y1] × [z0, z1] sampled at
 /// (nx+1) × (ny+1) × (nz+1) grid points.
 ///
+/// Process a single grid cell: returns triangles as position triples.
+/// Shared between the sequential and parallel extractors.
+fn process_cell<F: FnMut(f32, f32, f32) -> f32>(
+    f: &mut F,
+    v: &[[f32; 3]; 8],
+    vals: &[f32; 8],
+) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
+    let pos0 = vals[0] >= 0.0;
+    if vals.iter().all(|&v| (v >= 0.0) == pos0) {
+        return Vec::new();
+    }
+    let mut case_idx = 0u8;
+    for i in 0..8 {
+        if vals[i] < 0.0 {
+            case_idx |= 1 << i;
+        }
+    }
+    let edges = EDGE_TABLE[case_idx as usize];
+    if edges == 0 {
+        return Vec::new();
+    }
+    let mut edge_pts: [[f32; 3]; 12] = [[0.0; 3]; 12];
+    for e in 0..12 {
+        let (i0, i1) = EDGE_VERTS[e];
+        edge_pts[e] = lerp(v[i0], v[i1], vals[i0], vals[i1]);
+    }
+    let amb_faces = count_amb_faces_from_case(case_idx);
+    let tri_row: &[i8] = if amb_faces == 0 {
+        &TRI_TABLE[case_idx as usize]
+    } else {
+        let subcase = compute_mc33_subcase(f, v, vals);
+        mc33_tris(case_idx, subcase, amb_faces)
+    };
+    let mut out = Vec::new();
+    for chunk in tri_row.chunks(3) {
+        if chunk.len() < 3 || chunk[0] < 0 || chunk[1] < 0 || chunk[2] < 0 {
+            break;
+        }
+        out.push((
+            edge_pts[chunk[0] as usize],
+            edge_pts[chunk[1] as usize],
+            edge_pts[chunk[2] as usize],
+        ));
+    }
+    out
+}
 /// Returns flat positions and triangle indices (u32).
 pub fn extract<F: FnMut(f32, f32, f32) -> f32>(
     mut f: F,
@@ -153,15 +212,18 @@ pub fn extract<F: FnMut(f32, f32, f32) -> f32>(
     let dy = (y1 - y0) / ny as f32;
     let dz = (z1 - z0) / nz as f32;
 
-    // Sample the scalar field on the grid.
-    let mut grid = vec![vec![vec![0.0_f32; nz + 1]; ny + 1]; nx + 1];
+    // Sample the scalar field on a flat grid (cache-friendly, single
+    // allocation).  Indexing: grid[(ix*(ny+1) + iy)*(nz+1) + iz].
+    let sx = ny + 1;
+    let sy = nz + 1;
+    let mut grid = vec![0.0_f32; (nx + 1) * sx * sy];
     for ix in 0..=nx {
         let x = x0 + ix as f32 * dx;
         for iy in 0..=ny {
             let y = y0 + iy as f32 * dy;
             for iz in 0..=nz {
                 let z = z0 + iz as f32 * dz;
-                grid[ix][iy][iz] = f(x, y, z);
+                grid[(ix * sx + iy) * sy + iz] = f(x, y, z);
             }
         }
     }
@@ -183,53 +245,17 @@ pub fn extract<F: FnMut(f32, f32, f32) -> f32>(
                     [x0 + (ix    ) as f32 * dx, y0 + (iy + 1) as f32 * dy, z0 + (iz + 1) as f32 * dz],
                 ];
                 let vals = [
-                    grid[ix    ][iy    ][iz    ],
-                    grid[ix + 1][iy    ][iz    ],
-                    grid[ix + 1][iy + 1][iz    ],
-                    grid[ix    ][iy + 1][iz    ],
-                    grid[ix    ][iy    ][iz + 1],
-                    grid[ix + 1][iy    ][iz + 1],
-                    grid[ix + 1][iy + 1][iz + 1],
-                    grid[ix    ][iy + 1][iz + 1],
+                    grid[((ix    ) * sx + (iy    )) * sy + (iz    )],
+                    grid[((ix + 1) * sx + (iy    )) * sy + (iz    )],
+                    grid[((ix + 1) * sx + (iy + 1)) * sy + (iz    )],
+                    grid[((ix    ) * sx + (iy + 1)) * sy + (iz    )],
+                    grid[((ix    ) * sx + (iy    )) * sy + (iz + 1)],
+                    grid[((ix + 1) * sx + (iy    )) * sy + (iz + 1)],
+                    grid[((ix + 1) * sx + (iy + 1)) * sy + (iz + 1)],
+                    grid[((ix    ) * sx + (iy + 1)) * sy + (iz + 1)],
                 ];
 
-                let pos0 = vals[0] >= 0.0;
-                if vals.iter().all(|&v| (v >= 0.0) == pos0) {
-                    continue;
-                }
-
-                let mut case_idx = 0u8;
-                for i in 0..8 {
-                    if vals[i] < 0.0 {
-                        case_idx |= 1 << i;
-                    }
-                }
-
-                let edges = EDGE_TABLE[case_idx as usize];
-                if edges == 0 {
-                    continue;
-                }
-
-                let mut edge_pts: [[f32; 3]; 12] = [[0.0; 3]; 12];
-                for e in 0..12 {
-                    let (i0, i1) = EDGE_VERTS[e];
-                    edge_pts[e] = lerp(v[i0], v[i1], vals[i0], vals[i1]);
-                }
-
-                let amb_faces = count_amb_faces_from_case(case_idx);
-                let tri_row: &[i8] = if amb_faces == 0 {
-                    &TRI_TABLE[case_idx as usize]
-                } else {
-                    let subcase = compute_mc33_subcase(&mut f, &v, &vals);
-                    mc33_tris(case_idx, subcase, amb_faces)
-                };
-                for chunk in tri_row.chunks(3) {
-                    if chunk.len() < 3 || chunk[0] < 0 || chunk[1] < 0 || chunk[2] < 0 {
-                        break;
-                    }
-                    let p0 = edge_pts[chunk[0] as usize];
-                    let p1 = edge_pts[chunk[1] as usize];
-                    let p2 = edge_pts[chunk[2] as usize];
+                for (p0, p1, p2) in process_cell(&mut f, &v, &vals) {
                     let base = positions.len() as u32;
                     positions.push(p0);
                     positions.push(p1);
@@ -245,6 +271,125 @@ pub fn extract<F: FnMut(f32, f32, f32) -> f32>(
     // Fix face winding: some Bourke cases produce CW winding instead of CCW.
     // Compare each triangle's face normal against the gradient of f, flip if
     // they disagree. This prevents holes from back-face-culled triangles.
+    let h = 1e-4_f32;
+    let mut fixed = 0usize;
+    for tri in indices.chunks_exact_mut(3) {
+        let a = positions[tri[0] as usize];
+        let b = positions[tri[1] as usize];
+        let c = positions[tri[2] as usize];
+        let e1 = [b[0]-a[0], b[1]-a[1], b[2]-a[2]];
+        let e2 = [c[0]-a[0], c[1]-a[1], c[2]-a[2]];
+        let fnx = e1[1]*e2[2] - e1[2]*e2[1];
+        let fny = e1[2]*e2[0] - e1[0]*e2[2];
+        let fnz = e1[0]*e2[1] - e1[1]*e2[0];
+        let flen = (fnx*fnx + fny*fny + fnz*fnz).sqrt();
+        if flen < 1e-30 { continue; }
+        let cx = (a[0]+b[0]+c[0])/3.0;
+        let cy = (a[1]+b[1]+c[1])/3.0;
+        let cz = (a[2]+b[2]+c[2])/3.0;
+        let gx = f(cx+h,cy,cz) - f(cx-h,cy,cz);
+        let gy = f(cx,cy+h,cz) - f(cx,cy-h,cz);
+        let gz = f(cx,cy,cz+h) - f(cx,cy,cz-h);
+        let glen = (gx*gx+gy*gy+gz*gz).sqrt();
+        if glen < 1e-30 { continue; }
+        let dot = fnx*gx + fny*gy + fnz*gz;
+        if dot < 0.0 {
+            tri.swap(1, 2);
+            fixed += 1;
+        }
+    }
+    if fixed > 0 {
+        eprintln!("  [MC33] winding fix: {} tris flipped", fixed);
+    }
+
+    (positions, indices)
+}
+
+/// Parallel variant of [`extract`] for field samplers that are `Fn + Sync`.
+/// Grid sampling and per-cell triangulation are parallelised with rayon;
+/// the winding fix remains sequential (it is cheap relative to meshing).
+pub fn extract_par<F: Fn(f32, f32, f32) -> f32 + Sync + Send>(
+    f: F,
+    x_range: (f32, f32, usize),
+    y_range: (f32, f32, usize),
+    z_range: (f32, f32, usize),
+) -> (Vec<[f32; 3]>, Vec<u32>) {
+    use rayon::prelude::*;
+    let (x0, x1, nx) = x_range;
+    let (y0, y1, ny) = y_range;
+    let (z0, z1, nz) = z_range;
+    let dx = (x1 - x0) / nx as f32;
+    let dy = (y1 - y0) / ny as f32;
+    let dz = (z1 - z0) / nz as f32;
+
+    let sx = ny + 1;
+    let sy = nz + 1;
+    // Parallel grid sampling: each (ix,iy) row is independent.
+    let grid: Vec<f32> = (0..(nx + 1) * sx)
+        .into_par_iter()
+        .map(|idx| {
+            let ix = idx / sx;
+            let iy = idx % sx;
+            let x = x0 + ix as f32 * dx;
+            let y = y0 + iy as f32 * dy;
+            (0..=nz)
+                .map(|iz| {
+                    let z = z0 + iz as f32 * dz;
+                    f(x, y, z)
+                })
+                .collect::<Vec<_>>()
+        })
+        .flatten()
+        .collect();
+
+    // Parallel per-cell triangulation.  Each ix-slice produces a flat list
+    // of triangle positions; rayon concatenates the slices.
+    let tris: Vec<[f32; 3]> = (0..nx)
+        .into_par_iter()
+        .flat_map_iter(|ix| {
+            let mut slice = Vec::new();
+            for iy in 0..ny {
+                for iz in 0..nz {
+                    let v: [[f32; 3]; 8] = [
+                        [x0 + (ix    ) as f32 * dx, y0 + (iy    ) as f32 * dy, z0 + (iz    ) as f32 * dz],
+                        [x0 + (ix + 1) as f32 * dx, y0 + (iy    ) as f32 * dy, z0 + (iz    ) as f32 * dz],
+                        [x0 + (ix + 1) as f32 * dx, y0 + (iy + 1) as f32 * dy, z0 + (iz    ) as f32 * dz],
+                        [x0 + (ix    ) as f32 * dx, y0 + (iy + 1) as f32 * dy, z0 + (iz    ) as f32 * dz],
+                        [x0 + (ix    ) as f32 * dx, y0 + (iy    ) as f32 * dy, z0 + (iz + 1) as f32 * dz],
+                        [x0 + (ix + 1) as f32 * dx, y0 + (iy    ) as f32 * dy, z0 + (iz + 1) as f32 * dz],
+                        [x0 + (ix + 1) as f32 * dx, y0 + (iy + 1) as f32 * dy, z0 + (iz + 1) as f32 * dz],
+                        [x0 + (ix    ) as f32 * dx, y0 + (iy + 1) as f32 * dy, z0 + (iz + 1) as f32 * dz],
+                    ];
+                    let vals = [
+                        grid[((ix    ) * sx + (iy    )) * sy + (iz    )],
+                        grid[((ix + 1) * sx + (iy    )) * sy + (iz    )],
+                        grid[((ix + 1) * sx + (iy + 1)) * sy + (iz    )],
+                        grid[((ix    ) * sx + (iy + 1)) * sy + (iz    )],
+                        grid[((ix    ) * sx + (iy    )) * sy + (iz + 1)],
+                        grid[((ix + 1) * sx + (iy    )) * sy + (iz + 1)],
+                        grid[((ix + 1) * sx + (iy + 1)) * sy + (iz + 1)],
+                        grid[((ix    ) * sx + (iy + 1)) * sy + (iz + 1)],
+                    ];
+                    process_cell(&mut |x, y, z| f(x, y, z), &v, &vals)
+                        .into_iter()
+                        .for_each(|(a, b, c)| {
+                            slice.push(a);
+                            slice.push(b);
+                            slice.push(c);
+                        });
+                }
+            }
+            slice
+        })
+        .collect();
+
+    let n_tri = tris.len() / 3;
+    let positions = tris;
+    let mut indices: Vec<u32> = (0..n_tri as u32)
+        .flat_map(|t| [t * 3, t * 3 + 1, t * 3 + 2])
+        .collect();
+
+    // Sequential winding fix (cheap relative to meshing).
     let h = 1e-4_f32;
     let mut fixed = 0usize;
     for tri in indices.chunks_exact_mut(3) {
