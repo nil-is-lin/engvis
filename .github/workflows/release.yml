@@ -77,9 +77,29 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a ../../../artifacts/engvis-${{ matrix.target }}.zip engvis.exe
             cp engvis.exe ../../../artifacts/engvis-${{ matrix.target }}.exe
-          else
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            chmod +x engvis
+            mkdir -p dmg_staging
+            cp engvis dmg_staging/
+            hdiutil create -volname engvis -srcfolder dmg_staging \
+              -ov -format UDZO ../../../artifacts/engvis-${{ matrix.target }}.dmg
             tar czf ../../../artifacts/engvis-${{ matrix.target }}.tar.gz engvis
-            cp engvis ../../../artifacts/engvis-${{ matrix.target }}
+          else
+            chmod +x engvis
+            tar czf ../../../artifacts/engvis-${{ matrix.target }}.tar.gz engvis
+            DEB_VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+            mkdir -p deb_staging/usr/bin deb_staging/DEBIAN
+            cp engvis deb_staging/usr/bin/
+            cat > deb_staging/DEBIAN/control <<EOF
+Package: engvis
+Version: ${DEB_VERSION}
+Section: graphics
+Priority: optional
+Architecture: amd64
+Maintainer: nil
+Description: Engineering visualization framework with GPU rendering
+EOF
+            dpkg-deb --build deb_staging ../../../artifacts/engvis-${{ matrix.target }}.deb
           fi
 
       - name: Upload to release
