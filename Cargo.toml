@@ -35,7 +35,6 @@ members = [
     "crates/engvis-core",
     "crates/engvis-renderer",
     "fidget-demo", "examples/colorbar3d",
-    "tpms2step",
 ]
 
 [workspace.package]
