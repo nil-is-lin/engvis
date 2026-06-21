@@ -17,6 +17,9 @@ use engvis_renderer::{
     EngvisApp, AppCtx, FrameCtx, RunConfig, EventHandling, load_gltf,
 };
 
+use std::sync::{Arc, Mutex};
+use std::thread;
+
 // =====================================================================
 // 1. Implicit surface definition (shared by DC and MC33)
 // =====================================================================
@@ -263,10 +266,10 @@ enum MeshBackend { MarchingCubes33, DualContouring }
 
 fn build_dc_mesh(tree: fidget_core::context::Tree, name: &str, depth: u8) -> Mesh {
     use fidget_core::shape::Shape;
-    use fidget_core::vm::VmFunction;
+    use fidget_jit::JitFunction;
     use fidget_mesh::{Octree, Settings};
 
-    let shape = Shape::<VmFunction>::from(tree);
+    let shape = Shape::<JitFunction>::from(tree);
     let settings = Settings {
         depth,
         threads: Some(&fidget_core::render::ThreadPool::Global),
@@ -310,8 +313,8 @@ fn build_dc_mesh(tree: fidget_core::context::Tree, name: &str, depth: u8) -> Mes
 // 2b. Marching Cubes 33 — boundary naturally smooth
 // =====================================================================
 
-fn build_mc33_mesh(tree: fidget_core::context::Tree, name: &str, res: usize, skip_winding_fix: bool) -> Mesh {
-    build_mc33_mesh_domain(tree, name, res, skip_winding_fix, 1.0)
+fn build_mc33_mesh(tree: fidget_core::context::Tree, name: &str, res: usize) -> Mesh {
+    build_mc33_mesh_domain(tree, name, res, 1.0)
 }
 
 /// Like [`build_mc33_mesh`] but samples the cube `[-half, half]³`.
@@ -325,24 +328,71 @@ fn build_mc33_mesh_domain(
     tree: fidget_core::context::Tree,
     name: &str,
     res: usize,
-    skip_winding_fix: bool,
     half: f32,
 ) -> Mesh {
     use fidget_core::shape::Shape;
-    use fidget_core::vm::VmFunction;
+    use fidget_jit::JitFunction;
 
-    let shape = Shape::<VmFunction>::from(tree);
+    let t_shape = std::time::Instant::now();
+    let shape = Shape::<JitFunction>::from(tree);
 
     // Scale resolution with the padded domain so cell size stays ~constant.
     let res = ((res as f32) * half).ceil() as usize;
 
-    // Field evaluator: bulk-sampled internally by extract_par via a
-    // per-point closure backed by fidget's float-slice tape.
     let float_tape = shape.float_slice_tape(Default::default());
+    let dt_shape = t_shape.elapsed();
+
+    // ── Batch grid evaluation ────────────────────────────────────
+    //
+    // Instead of calling f() per grid point (which creates a new fidget
+    // evaluator each time), we build coordinate arrays for the entire
+    // grid and evaluate them in a single float_slice_eval call.
+    // For res=256 this replaces ~17M individual evaluator creations
+    // with a single batch evaluation.
+    let (x0, x1) = (-half, half);
+    let (y0, y1) = (-half, half);
+    let (z0, z1) = (-half, half);
+    let nx = res; let ny = res; let nz = res;
+    let dx = (x1 - x0) / nx as f32;
+    let dy = (y1 - y0) / ny as f32;
+    let dz = (z1 - z0) / nz as f32;
+    let sx = ny + 1;
+    let sy = nz + 1;
+    let total = (nx + 1) * sx * sy;
+
+    let t_grid = std::time::Instant::now();
+    let mut xs = Vec::with_capacity(total);
+    let mut ys = Vec::with_capacity(total);
+    let mut zs = Vec::with_capacity(total);
+    for ix in 0..=nx {
+        let x = x0 + ix as f32 * dx;
+        for iy in 0..=ny {
+            let y = y0 + iy as f32 * dy;
+            for iz in 0..=nz {
+                xs.push(x);
+                ys.push(y);
+                zs.push(z0 + iz as f32 * dz);
+            }
+        }
+    }
+    let dt_build = t_grid.elapsed();
+
+    let t_eval = std::time::Instant::now();
+    let grid = {
+        let mut eval = Shape::<JitFunction>::new_float_slice_eval();
+        match eval.eval(&float_tape, &xs, &ys, &zs) {
+            Ok(r) => r.to_vec(),
+            Err(_) => vec![1e9_f32; total],
+        }
+    };
+    let dt_eval = t_eval.elapsed();
+
+    // Per-point closure for ambiguous-face resolution and winding fix
+    // gradient (rare calls, not worth batching).
     let point_eval = {
         let tape = float_tape.clone();
         move |x: f32, y: f32, z: f32| -> f32 {
-            let mut eval = Shape::<VmFunction>::new_float_slice_eval();
+            let mut eval = Shape::<JitFunction>::new_float_slice_eval();
             match eval.eval(&tape, &[x], &[y], &[z]) {
                 Ok(r) => r[0],
                 Err(_) => 1e9,
@@ -350,12 +400,15 @@ fn build_mc33_mesh_domain(
         }
     };
 
-    let (mut pos, idx) = marching_cubes::extract_par(
+    let t_extract = std::time::Instant::now();
+    let (mut pos, idx) = marching_cubes::extract_par_with_grid(
         point_eval,
-        (-half, half, res),
-        (-half, half, res),
-        (-half, half, res),
+        &grid,
+        (x0, x1, nx),
+        (y0, y1, ny),
+        (z0, z1, nz),
     );
+    let dt_extract = t_extract.elapsed();
     // Only the non-padded path (half == 1) clamps stray vertices back to
     // the sampling box.  For padded box-CSG solids the surface closes a
     // little outside [-1,1]; clamping there would collapse distinct
@@ -375,20 +428,27 @@ fn build_mc33_mesh_domain(
     eprintln!("  [MC33] {} verts, {} tris (res={})",
         pos.len(), idx.len() / 3, res);
 
-    let mut mesh = if skip_winding_fix {
-        Mesh::from_triangles_open(name, &pos, &idx)
-    } else {
-        // extract_par already applied a gradient-based winding fix, so we
-        // only need from_triangles for vertex deduplication (adjacent MC
-        // cells emit duplicate edge vertices).  from_triangles also runs
-        // a neighbour-consistency winding pass, which is complementary.
-        Mesh::from_triangles(name, &pos, &idx)
-    };
+    // extract_par's gradient-based winding fix uses the (possibly
+    // composite) field's gradient, which can be zero at CSG creases
+    // (e.g. f²−half_t² at f=0).  Run the full BFS winding fix here
+    // to propagate consistent winding across all faces, fixing any
+    // triangles that the gradient fix skipped.
+    let t_mesh = std::time::Instant::now();
+    let mut mesh = Mesh::from_triangles(name, &pos, &idx);
+    let dt_mesh = t_mesh.elapsed();
+    let t_norm = std::time::Instant::now();
     overwrite_normals_with_gradient(&shape, &mut mesh);
+    let dt_norm = t_norm.elapsed();
+    eprintln!(
+        "  [MC33 timing] shape={:.0}ms grid_build={:.0}ms eval={:.0}ms extract={:.0}ms from_triangles={:.0}ms normals={:.0}ms",
+        dt_shape.as_secs_f64() * 1e3,
+        dt_build.as_secs_f64() * 1e3, dt_eval.as_secs_f64() * 1e3,
+        dt_extract.as_secs_f64() * 1e3, dt_mesh.as_secs_f64() * 1e3,
+        dt_norm.as_secs_f64() * 1e3,
+    );
     mesh
 }
 
-/// Recompute area-weighted smooth normals from triangle geometry.
 /// Used after `clip_mesh_to_ball` which creates new vertices with
 /// zero normals.
 fn recompute_smooth_normals(mesh: &mut Mesh) {
@@ -662,7 +722,7 @@ fn clip_mesh_to_ball(mesh: &mut Mesh, c: [f32; 3], r: f32) {
 /// provided the cell size is smaller than the wall thickness.
 ///
 /// The field is CSG-intersected with the unit-box solid so MC
-/// generates cap faces on `x/y/z = ±1`, yielding a watertight wall.
+/// generates cap faces on `x/y/z = ±c`, yielding a watertight wall.
 fn build_shell_mesh(
     tree: fidget_core::context::Tree,
     half_t: f32,
@@ -683,7 +743,7 @@ fn build_shell_mesh(
     // CSG-intersect with the box.
     let wall = tree.square() - half_t * half_t;
     let field = wall.max(box_sdf);
-    let mut mesh = build_mc33_mesh_domain(field, name, res, false, half);
+    let mut mesh = build_mc33_mesh_domain(field, name, res, half);
 
     if clip_to_unit_ball {
         clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], clip_radius);
@@ -692,15 +752,16 @@ fn build_shell_mesh(
         recompute_smooth_normals(&mut mesh);
     }
 
-    let topo = engvis_core::topology::compute_topology(&mesh);
-    eprintln!(
-        "  [shell] V={} F={} | χ={} boundary_edges={} components={} watertight={}",
-        mesh.vertices.len(), mesh.indices.len() / 3,
-        topo.euler, topo.boundary_edges, topo.connected_components, topo.is_watertight,
-    );
+    if std::env::var("ENGVIS_TOPO").is_ok() {
+        let topo = engvis_core::topology::compute_topology(&mesh);
+        eprintln!(
+            "  [shell] V={} F={} | χ={} boundary_edges={} components={} watertight={}",
+            mesh.vertices.len(), mesh.indices.len() / 3,
+            topo.euler, topo.boundary_edges, topo.connected_components, topo.is_watertight,
+        );
+    }
     mesh
 }
-
 fn build_mesh(
     tree: fidget_core::context::Tree,
     name: &str,
@@ -728,12 +789,12 @@ fn build_mesh(
         match backend {
             MeshBackend::DualContouring => build_dc_mesh(clipped, name, depth),
             MeshBackend::MarchingCubes33 =>
-                build_mc33_mesh_domain(clipped, name, mc_res, false, half),
+                build_mc33_mesh_domain(clipped, name, mc_res, half),
         }
     } else {
         match backend {
             MeshBackend::DualContouring => build_dc_mesh(tree.clone(), name, depth),
-            MeshBackend::MarchingCubes33 => build_mc33_mesh(tree.clone(), name, mc_res, false),
+            MeshBackend::MarchingCubes33 => build_mc33_mesh(tree.clone(), name, mc_res),
         }
     };
     let mut mesh = mesh;
@@ -758,7 +819,7 @@ fn build_mesh(
 // 3. Box-face helpers and Marching Squares (for MS-loop visualization)
 // =====================================================================
 
-#[derive(Clone, Copy)]
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 enum Face { Xp, Xm, Yp, Ym, Zp, Zm }
 
 impl Face {
@@ -1039,7 +1100,9 @@ fn overwrite_normals_with_gradient<F:fidget_core::eval::Function+Clone>(
     }
 }
 
-// =====================================================================
+/// Smart normal assignment with vertex splitting for CSG-intersected meshes.
+///
+/// The composite field `g = max(f, box_sdf)` has a C¹-discontinuity at the
 // 5. App
 // =====================================================================
 
@@ -1074,6 +1137,59 @@ const TPMS_SURFACES: &[(&str, &str)] = &[
     ("fischer-koch-cp","Fischer-Koch CP"),
 ];
 
+/// 二分查找 C 值使 vol_frac(C) = target_phi。
+///
+/// vol_frac(C) = |{p ∈ domain : f(p) < C}| / |domain|
+/// 是 C 的单调递增函数，可用二分查找求解。
+///
+/// 采样在 [-1,1]³ 上进行，N=48³（~110K 点，JIT eval 约 1ms）。
+fn solve_c_for_vol_frac(
+    tree: &fidget_core::context::Tree,
+    target_phi: f32,
+    _period: f32,
+) -> f32 {
+    use fidget_core::shape::Shape;
+    use fidget_jit::JitFunction;
+
+    let phi = target_phi.clamp(0.001, 0.999);
+
+    let shape = Shape::<JitFunction>::from(tree.clone());
+    let tape = shape.float_slice_tape(Default::default());
+    let mut eval = Shape::<JitFunction>::new_float_slice_eval();
+
+    // 采样网格
+    let n = 48i32;
+    let total = (n * n * n) as usize;
+    let mut xs = Vec::with_capacity(total);
+    let mut ys = Vec::with_capacity(total);
+    let mut zs = Vec::with_capacity(total);
+    for ix in 0..n {
+        let x = -1.0 + 2.0 * ix as f32 / (n - 1) as f32;
+        for iy in 0..n {
+            let y = -1.0 + 2.0 * iy as f32 / (n - 1) as f32;
+            for iz in 0..n {
+                xs.push(x);
+                ys.push(y);
+                zs.push(-1.0 + 2.0 * iz as f32 / (n - 1) as f32);
+            }
+        }
+    }
+
+    let vals = match eval.eval(&tape, &xs, &ys, &zs) {
+        Ok(r) => r.to_vec(),
+        Err(_) => return 0.0,
+    };
+
+    // 二分查找：找到 C 使 vals 中 < C 的比例 = phi
+    let mut sorted: Vec<f32> = vals.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // vol_frac(C) = count(vals < C) / total
+    // 目标：count = phi * total
+    let target_count = (phi * total as f32).round() as usize;
+    let idx = target_count.min(total - 1);
+    sorted[idx]
+}
+
 struct App {
     // ── implicit surface source ──
     source: SurfaceSource,
@@ -1090,7 +1206,8 @@ struct App {
     torus_minor_r: f32,
     tpms_period: f32,
     tpms_thickness: f32,
-    tpms_iso_level: f32,
+    /// 体积分数 φ ∈ [0,1]：0.5=对称极小曲面，→0/1=完全填充。
+    tpms_vol_frac: f32,
     morphology: Morphology,
 
     // ── meshing ──
@@ -1124,9 +1241,68 @@ struct App {
     camera_fitted: bool,
     last_topology: Option<engvis_core::topology::MeshTopology>,
     last_build_ok: bool,
+
+    // ── async mesh building ──
+    /// Background mesh build result (None = idle or building).
+    mesh_build_result: Option<Arc<Mutex<Option<MeshBuildResult>>>>,
+    /// Human-readable build status for the status bar.
+    build_status: String,
 }
 
-impl App {
+/// Cloneable snapshot of the App state needed for mesh building.
+/// This is sent to a background thread to avoid blocking the UI.
+#[derive(Clone)]
+struct AppBuildSnapshot {
+    source: SurfaceSource,
+    custom_expr: String,
+    clip_to_unit_ball: bool,
+    clip_radius: f32,
+    sphere_radius: f32,
+    torus_major_r: f32,
+    torus_minor_r: f32,
+    tpms_period: f32,
+    tpms_thickness: f32,
+    /// 体积分数 φ ∈ [0,1]：0.5=对称极小曲面，→0/1=完全填充。
+    /// 内部通过二分查找求解对应的 C 值（f = C 的等值面）。
+    tpms_vol_frac: f32,
+    morphology: Morphology,
+    mesh_backend: MeshBackend,
+    surf_depth: u8,
+    mc_res: usize,
+    show_ms_loops: bool,
+    show_bounding: bool,
+    show_surface_edges: bool,
+    surface_color: [f32; 3],
+    wireframe_color: [f32; 3],
+    wireframe_line_width: f32,
+}
+
+impl AppBuildSnapshot {
+    fn from_app(app: &App) -> Self {
+        Self {
+            source: app.source.clone(),
+            custom_expr: app.custom_expr.clone(),
+            clip_to_unit_ball: app.clip_to_unit_ball,
+            clip_radius: app.clip_radius,
+            sphere_radius: app.sphere_radius,
+            torus_major_r: app.torus_major_r,
+            torus_minor_r: app.torus_minor_r,
+            tpms_period: app.tpms_period,
+            tpms_thickness: app.tpms_thickness,
+            tpms_vol_frac: app.tpms_vol_frac,
+            morphology: app.morphology,
+            mesh_backend: app.mesh_backend,
+            surf_depth: app.surf_depth,
+            mc_res: app.mc_res,
+            show_ms_loops: app.show_ms_loops,
+            show_bounding: app.show_bounding,
+            show_surface_edges: app.show_surface_edges,
+            surface_color: app.surface_color,
+            wireframe_color: app.wireframe_color,
+            wireframe_line_width: app.wireframe_line_width,
+        }
+    }
+
     fn surface_label(&self) -> String {
         match &self.source {
             SurfaceSource::BuiltIn(n) => (*n).to_string(),
@@ -1134,56 +1310,44 @@ impl App {
         }
     }
 
-    fn tree_params(&self) -> TreeParams<'_> {
-        let name = match &self.source {
-            SurfaceSource::BuiltIn(n) => *n,
-            SurfaceSource::Custom => "custom",
-        };
-        TreeParams {
-            name,
-            sphere_radius: self.sphere_radius,
-            torus_major_r: self.torus_major_r,
-            torus_minor_r: self.torus_minor_r,
-            tpms_period: self.tpms_period,
-        }
-    }
-
     fn current_tree(&self) -> Result<fidget_core::context::Tree, String> {
         match &self.source {
             SurfaceSource::BuiltIn(_) => {
-                let p = self.tree_params();
+                let p = TreeParams {
+                    name: match &self.source {
+                        SurfaceSource::BuiltIn(n) => *n,
+                        SurfaceSource::Custom => "custom",
+                    },
+                    sphere_radius: self.sphere_radius,
+                    torus_major_r: self.torus_major_r,
+                    torus_minor_r: self.torus_minor_r,
+                    tpms_period: self.tpms_period,
+                };
                 Ok(build_tree(&p))
             }
             SurfaceSource::Custom => build_tree_from_rhai(&self.custom_expr),
         }
     }
 
-    /// Build the scene with the surface mesh and optional MS-loop overlay.
-    /// Updates `last_topology` and `last_build_ok` for the status bar.
-    fn build_scene(&mut self) -> Scene {
+    /// Compute the scene, topology, and build status as a detached result.
+    fn build_scene_result(&self) -> MeshBuildResult {
         use fidget_core::shape::Shape;
-        use fidget_core::vm::VmFunction;
+        use fidget_jit::JitFunction;
 
         let tree = match self.current_tree() {
-            Ok(t) => { self.custom_error = None; t }
+            Ok(t) => t,
             Err(e) => {
-                eprintln!("expression error: {e}");
-                self.custom_error = Some(e);
-                self.last_build_ok = false;
-                // Empty scene
-                return Scene::default();
+                return MeshBuildResult {
+                    scene: Scene::default(),
+                    topology: None,
+                    build_ok: false,
+                    error: Some(e),
+                };
             }
         };
 
         let label = self.surface_label();
 
-        // Shell half-thickness in *field* units.  The user-facing
-        // `tpms_thickness` is a true *geometric* wall thickness (the
-        // physical distance across the wall).  A TPMS f(kx,ky,kz) has
-        // |∇f| ≈ k near its surface, so a geometric half-thickness `d`
-        // corresponds to a field offset `half_t = d · |∇f| ≈ d · k`.
-        // We therefore convert: half_t = (thickness/2) · k.
-        // For non-TPMS surfaces |∇f| ≈ 1, so k falls back to 1.
         let shell_grad = if matches!(&self.source,
             SurfaceSource::BuiltIn(n) if TPMS_SURFACES.iter().any(|(k,_)| k == n))
         {
@@ -1197,53 +1361,46 @@ impl App {
             0.0
         };
 
-        // Apply morphology transformation for TPMS surfaces.
-        // Shell:    handled separately via build_shell_mesh (smooth
-        //           f²−half_t² solid wall), so the tree stays
-        //           untransformed here.
-        // Skeletal: f − C = 0 → shifted iso-level forming solid strut network.
+        // ── 体积分数 → C 值求解 ─────────────────────────────
+        // 用户设置体积分数 φ，内部二分查找 C 使 vol_frac(C) = φ。
+        // vol_frac(C) = |{p : f(p) < C}| / |domain|，是 C 的单调递增函数。
+        let c_value = if matches!(self.morphology,
+            Morphology::MinimalSurface | Morphology::Skeletal)
+        {
+            solve_c_for_vol_frac(&tree, self.tpms_vol_frac, self.tpms_period)
+        } else {
+            0.0
+        };
+
         let tree = match self.morphology {
-            Morphology::MinimalSurface | Morphology::Shell => tree,
+            // Minimal surface: the iso-surface f = C (C is the user's
+            // level-set parameter; C = 0 gives the classic minimal
+            // surface).  Subtracting C shifts the zero-set to f = C.
+            Morphology::MinimalSurface => tree.clone() - c_value,
+            Morphology::Shell => tree,
             Morphology::Skeletal => {
-                tree.clone() - self.tpms_iso_level
+                tree.clone() - c_value
             }
         };
-        // Adaptive resolution: when the surface features are thinner
-        // than ~3 MC33 grid cells the mesh becomes degenerate.
-        // Bump the resolution automatically, capped at 512.
         let effective_res = {
             let mut min_feature = match &self.source {
-                // Torus tube diameter ≈ 2 * minor_r
                 SurfaceSource::BuiltIn("torus") => 2.0 * self.torus_minor_r,
-                // TPMS half-period ≈ π/k
                 SurfaceSource::BuiltIn(n)
                     if TPMS_SURFACES.iter().any(|(k,_)| k == n) => std::f32::consts::PI / self.tpms_period,
-                _ => 0.5, // sphere & others are well-resolved even at res=16
+                _ => 0.5,
             };
-            // Shell wall *geometric* thickness = 2·half_t/|∇f| =
-            // tpms_thickness (by construction of shell_half_t above).
-            // MC cannot resolve a wall thinner than ~1 grid cell, so the
-            // wall thickness becomes the limiting feature.
             if matches!(self.morphology, Morphology::Shell) {
-                let wall = self.tpms_thickness; // geometric, by construction
+                let wall = self.tpms_thickness;
                 if wall < min_feature {
                     min_feature = wall;
                 }
             }
-            // Shell needs cell < ~wall/10 to mesh the f²−half_t² band
-            // cleanly (the wall is pierced on both sides), so it uses a
-            // higher coefficient and floor than minimal/skeletal modes.
             let coeff = if matches!(self.morphology, Morphology::Shell) { 10.0 } else { 6.0 };
             let mut needed = ((coeff / min_feature) as usize).max(self.mc_res).min(512);
-            // Shell/Skeletal need a resolution floor for thin walls.
             if matches!(self.morphology, Morphology::Shell) {
                 needed = needed.max(96);
             } else if matches!(self.morphology, Morphology::Skeletal) {
                 needed = needed.max(64);
-            }
-            if needed > self.mc_res {
-                eprintln!("  [MC33] auto-bump res {} -> {} (feature {:.3})",
-                    self.mc_res, needed, min_feature);
             }
             needed
         };
@@ -1260,9 +1417,7 @@ impl App {
                 self.morphology,
             )
         };
-        // Topology stats for the status bar.
-        self.last_topology = Some(compute_topology(&mesh));
-        self.last_build_ok = true;
+        let topology = Some(compute_topology(&mesh));
 
         let mat = PbrMaterial {
             name: "Surface".into(),
@@ -1272,13 +1427,12 @@ impl App {
             ..Default::default()
         };
         let mut scene = Scene::single_mesh(&label, mesh, mat);
-        // The surface node is index 0; toggle its triangle-edge overlay.
         if let Some(n) = scene.nodes.first_mut() {
             n.render_edges = self.show_surface_edges;
         }
 
         if self.show_ms_loops {
-            let shape = Shape::<VmFunction>::from(tree);
+            let shape = Shape::<JitFunction>::from(tree);
             let ms_mesh = build_ms_loops_mesh(&shape, 64);
             let ms_mat = PbrMaterial {
                 name: "MS-loops".into(),
@@ -1324,7 +1478,55 @@ impl App {
             });
         }
 
-        scene
+        MeshBuildResult {
+            scene,
+            topology,
+            build_ok: true,
+            error: None,
+        }
+    }
+}
+
+/// Result of an async mesh build.
+struct MeshBuildResult {
+    scene: Scene,
+    topology: Option<engvis_core::topology::MeshTopology>,
+    build_ok: bool,
+    error: Option<String>,
+}
+
+impl App {
+    fn surface_label(&self) -> String {
+        match &self.source {
+            SurfaceSource::BuiltIn(n) => (*n).to_string(),
+            SurfaceSource::Custom => "custom".to_string(),
+        }
+    }
+
+    fn tree_params(&self) -> TreeParams<'_> {
+        let name = match &self.source {
+            SurfaceSource::BuiltIn(n) => *n,
+            SurfaceSource::Custom => "custom",
+        };
+        TreeParams {
+            name,
+            sphere_radius: self.sphere_radius,
+            torus_major_r: self.torus_major_r,
+            torus_minor_r: self.torus_minor_r,
+            tpms_period: self.tpms_period,
+        }
+    }
+
+    /// Build the scene synchronously (used for initial setup and fallback).
+    fn build_scene_sync(&mut self) -> Scene {
+        let snapshot = AppBuildSnapshot::from_app(self);
+        let result = snapshot.build_scene_result();
+        self.last_topology = result.topology;
+        self.last_build_ok = result.build_ok;
+        if let Some(e) = &result.error {
+            self.custom_error = Some(e.clone());
+        }
+        result.scene
     }
 
     /// Replace the current scene with a single imported mesh.
@@ -1363,7 +1565,8 @@ impl EngvisApp for App {
     }
 
     fn on_setup(&mut self, _ctx: &mut AppCtx) -> Scene {
-        self.build_scene()
+        // Initial build is synchronous (fast for default low resolution).
+        self.build_scene_sync()
     }
 
     fn on_ready(&mut self, _scene: &Scene, camera: &mut OrbitCamera) {
@@ -1375,12 +1578,53 @@ impl EngvisApp for App {
     }
 
     fn ui(&mut self, egui_ctx: &egui::Context, frame: &mut FrameCtx) {
-        // ── Apply pending file actions and remesh ─────────────────
-        if self.needs_remesh {
-            *frame.scene = self.build_scene();
-            *frame.scene_dirty = true;
+        // ── Check for completed async mesh build ───────────────────
+        if let Some(result_arc) = &self.mesh_build_result {
+            let done = {
+                let guard = result_arc.lock().unwrap();
+                guard.is_some()
+            };
+            if done {
+                let result = {
+                    let mut guard = result_arc.lock().unwrap();
+                    guard.take().unwrap()
+                };
+                self.mesh_build_result = None;
+                self.last_topology = result.topology;
+                self.last_build_ok = result.build_ok;
+                if let Some(e) = &result.error {
+                    self.custom_error = Some(e.clone());
+                    self.build_status = format!("build failed: {e}");
+                } else {
+                    self.custom_error = None;
+                    self.build_status = "ready".into();
+                }
+                *frame.scene = result.scene;
+                *frame.scene_dirty = true;
+            }
+        }
+
+        // ── Launch async mesh build when requested ─────────────────
+        if self.needs_remesh && self.mesh_build_result.is_none() {
             self.needs_remesh = false;
-            self.camera_fitted = false;
+            self.build_status = "building...".into();
+            // Clone the app state needed for the build.
+            let app_snapshot = AppBuildSnapshot::from_app(self);
+            let result_slot = Arc::new(Mutex::new(None));
+            self.mesh_build_result = Some(result_slot.clone());
+            let slot = result_slot.clone();
+            thread::spawn(move || {
+                let result = app_snapshot.build_scene_result();
+                let mut guard = slot.lock().unwrap();
+                *guard = Some(result);
+            });
+            // Request continuous repaint while building.
+            egui_ctx.request_repaint();
+        }
+
+        // While building, keep requesting repaints to check completion.
+        if self.mesh_build_result.is_some() {
+            egui_ctx.request_repaint();
         }
         if let Some(path) = self.pending_load.take() {
             // glTF goes through the renderer's loader (textures, nodes);
@@ -1503,7 +1747,11 @@ impl EngvisApp for App {
         // ── Bottom status bar ─────────────────────────────────────
         egui::TopBottomPanel::bottom("status_bar").show(egui_ctx, |ui| {
             ui.horizontal(|ui| {
-                if self.last_build_ok {
+                // Build status indicator
+                if self.mesh_build_result.is_some() {
+                    ui.colored_label(egui::Color32::from_rgb(255, 200, 0),
+                        "Building mesh...");
+                } else if self.last_build_ok {
                     if let Some(t) = &self.last_topology {
                         ui.label(format!(
                             "V={}  E={}  F={}  χ={}  ∂E={}  comps={}  watertight={}",
@@ -1658,7 +1906,7 @@ impl App {
                 ui.label("Morphology:");
                 let mut morph = self.morphology;
                 if ui.radio_value(&mut morph, Morphology::MinimalSurface,
-                    "Minimal surface  (f = 0)").changed() {
+                    "Minimal surface  (f = C)").changed() {
                     self.morphology = morph; self.needs_remesh = true;
                 }
                 if ui.radio_value(&mut morph, Morphology::Shell,
@@ -1679,12 +1927,18 @@ impl App {
                             "  geometric wall thickness = {:.3}", self.tpms_thickness));
                     }
                     Morphology::Skeletal => {
-                        if ui.add(egui::Slider::new(&mut self.tpms_iso_level,
-                            -1.0..=2.0).text("C value")).changed() {
+                        if ui.add(egui::Slider::new(&mut self.tpms_vol_frac,
+                            0.01..=0.99).text("Volume fraction φ")).changed() {
                             self.needs_remesh = true;
                         }
                     }
-                    Morphology::MinimalSurface => {}
+                    Morphology::MinimalSurface => {
+                        if ui.add(egui::Slider::new(&mut self.tpms_vol_frac,
+                            0.01..=0.99).text("Volume fraction φ")).changed() {
+                            self.needs_remesh = true;
+                        }
+                        ui.label("  φ=0.5 → minimal surface (f=0)");
+                    }
                 }
             });
         }
@@ -1861,27 +2115,109 @@ fn main() {
     env_logger::init();
 
     if std::env::args().any(|a| a == "--selftest") {
-        // Test thin-wall shell meshing (smooth g = f²−half_t², box-CSG).
-        // Geometric thickness 0.1 → half_t = 0.5·0.1·k (k = period).
-        eprintln!("--- thin-wall shell mesh (build_shell_mesh) ---");
+        unsafe { std::env::set_var("ENGVIS_TOPO", "1"); }
+        // ── TPMS 值域采样 ─────────────────────────────────────
+        // 在单位立方体内均匀采样，统计各 TPMS 函数的 [min, max] 值域，
+        // 用于判断 UI 中 C value slider 范围是否合理。
+        eprintln!("\n[tpms range] sampling value ranges (period=4.0, N=64³):");
+        for &(name, _) in TPMS_SURFACES {
+            let p2 = TreeParams {
+                name, sphere_radius: 0.8,
+                torus_major_r: 0.6, torus_minor_r: 0.2, tpms_period: 4.0,
+            };
+            let tree2 = build_tree(&p2);
+            use fidget_core::shape::Shape;
+            use fidget_jit::JitFunction;
+            let shape2 = Shape::<JitFunction>::from(tree2);
+            let tape2 = shape2.float_slice_tape(Default::default());
+            let mut ev2 = Shape::<JitFunction>::new_float_slice_eval();
+            let n = 64;
+            let mut xs = Vec::with_capacity(n*n*n);
+            let mut ys = Vec::with_capacity(n*n*n);
+            let mut zs = Vec::with_capacity(n*n*n);
+            for ix in 0..n {
+                let x = -1.0 + 2.0 * ix as f32 / n as f32;
+                for iy in 0..n {
+                    let y = -1.0 + 2.0 * iy as f32 / n as f32;
+                    for iz in 0..n {
+                        xs.push(x); ys.push(y); zs.push(-1.0 + 2.0 * iz as f32 / n as f32);
+                    }
+                }
+            }
+            let vals = ev2.eval(&tape2, &xs, &ys, &zs).unwrap_or_default();
+            let (mn, mx) = vals.iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), &v| {
+                    (mn.min(v), mx.max(v))
+                });
+            // 体积分数：f < C 的比例（C=0 时为负相占比）
+            let neg_frac = vals.iter().filter(|&&v| v < 0.0).count() as f32 / vals.len() as f32;
+            eprintln!("  {:<16} range=[{:+.3}, {:+.3}]  vol_frac(C=0)={:.3}",
+                name, mn, mx, neg_frac);
+        }
+
+        // Validate the volume-fraction → C solver: varying φ must shift
+        // the zero-set, producing a different mesh.
         let p = TreeParams { name: "gyroid", sphere_radius: 0.8,
             torus_major_r: 0.6, torus_minor_r: 0.2, tpms_period: 4.0 };
         let tree = build_tree(&p);
-        let thickness = 0.1_f32;
-        let half_t = 0.5 * thickness * p.tpms_period;
-        eprintln!("  thickness(geom) = {}  half_t(field) = {}", thickness, half_t);
-        for &res in &[64usize, 96, 128] {
-            let mesh = build_shell_mesh(
-                tree.clone(), half_t, "shell-test", res,
-                false, 1.0,
+        for phi in [0.3_f32, 0.5, 0.7] {
+            let c_val = solve_c_for_vol_frac(&tree, phi, 4.0);
+            let field = tree.clone() - c_val;
+            let mesh = build_mesh(
+                field, "iso-test",
+                MeshBackend::MarchingCubes33, 6, 96,
+                false, 1.0, Morphology::MinimalSurface,
             );
-            let topo = engvis_core::topology::compute_topology(&mesh);
-            eprintln!(
-                "  res={} shell: V={} F={} | χ={} boundary_edges={} components={} watertight={}",
-                res, mesh.vertices.len(), mesh.indices.len() / 3,
-                topo.euler, topo.boundary_edges, topo.connected_components, topo.is_watertight,
-            );
+            // Mean |f - C| over the mesh: should be ≈0 since vertices
+            // lie on f = C  ⇔  (f − C) = 0.
+            use fidget_core::shape::Shape;
+            use fidget_jit::JitFunction;
+            let shifted = Shape::<JitFunction>::from(tree.clone() - c_val);
+            let tape = shifted.float_slice_tape(Default::default());
+            let mut ev = Shape::<JitFunction>::new_float_slice_eval();
+            let (mut sum, mut n) = (0.0_f64, 0usize);
+            for v in &mesh.vertices {
+                let pp = v.position;
+                let f = ev.eval(&tape, &[pp[0]], &[pp[1]], &[pp[2]])
+                    .map(|r| r[0]).unwrap_or(9.9);
+                sum += (f as f64).abs(); n += 1;
+            }
+            eprintln!("φ={:.2} → C={:+.3}: verts={} mean|f-C|={:.5}",
+                phi, c_val, mesh.vertices.len(), sum / n.max(1) as f64);
         }
+
+        // Skeletal mesh topology test: MC33 TPMS surface + box CSG cap.
+        eprintln!("\n[skeletal selftest] building skeletal mesh (gyroid, res=64)...");
+        let t0 = std::time::Instant::now();
+        let sk_mesh = build_mesh(
+            tree.clone(), "skeletal-test",
+            MeshBackend::MarchingCubes33, 5, 64,
+            false, 1.0, Morphology::Skeletal,
+        );
+        let sk_dt = t0.elapsed();
+        let sk_topo = engvis_core::topology::compute_topology(&sk_mesh);
+        eprintln!(
+            "[skeletal selftest] V={} F={} | χ={} boundary_edges={} components={} watertight={} | {:.0}ms",
+            sk_mesh.vertices.len(), sk_mesh.indices.len() / 3,
+            sk_topo.euler, sk_topo.boundary_edges,
+            sk_topo.connected_components, sk_topo.is_watertight,
+            sk_dt.as_secs_f64() * 1e3,
+        );
+
+        // Shell mesh topology test: MC33 TPMS shell + box CSG cap.
+        eprintln!("\n[shell selftest] building shell mesh (gyroid, res=96)...");
+        let shell_half_t = 0.5 * 0.1 * p.tpms_period.max(1.0);
+        let t0 = std::time::Instant::now();
+        let sh_mesh = build_shell_mesh(
+            tree.clone(), shell_half_t, "shell-test", 96,
+            false, 1.0,
+        );
+        let sh_dt = t0.elapsed();
+        eprintln!(
+            "[shell selftest] V={} F={} | {:.0}ms (topology already printed above)",
+            sh_mesh.vertices.len(), sh_mesh.indices.len() / 3,
+            sh_dt.as_secs_f64() * 1e3,
+        );
         return;
     }
 
@@ -1897,7 +2233,7 @@ fn main() {
         torus_minor_r: 0.2,
         tpms_period: 4.0,
         tpms_thickness: 0.1,
-        tpms_iso_level: 0.5,
+        tpms_vol_frac: 0.5,
         morphology: Morphology::MinimalSurface,
         mesh_backend: MeshBackend::MarchingCubes33,
         surf_depth: 7,
@@ -1917,5 +2253,7 @@ fn main() {
         camera_fitted: false,
         last_topology: None,
         last_build_ok: true,
+        mesh_build_result: None,
+        build_status: "ready".into(),
     });
 }

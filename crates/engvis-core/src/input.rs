@@ -70,7 +70,10 @@ impl InputState {
             let dx = (self.cursor_x - self.last_cursor_x) as f32;
             let dy = (self.cursor_y - self.last_cursor_y) as f32;
             let pan_speed = camera.distance * 0.002;
-            camera.pan(-dx * pan_speed, dy * pan_speed);
+            // Screen y grows downward, so dragging up gives dy < 0.
+            // Move the target along -dx/-dy so the object follows the
+            // cursor: drag up → object up, drag right → object right.
+            camera.pan(-dx * pan_speed, -dy * pan_speed);
         }
         if self.scroll_delta.abs() > f32::EPSILON && !self.egui_wants_pointer && in_viewport {
             camera.zoom(self.scroll_delta * 0.1);

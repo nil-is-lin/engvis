@@ -137,37 +137,59 @@ pub fn position(&self) -> Vec3 {
 
 \subsection{Incremental Orbit Rotation}
 
-Mouse drag produces two incremental rotations per frame:
+Mouse drag produces two incremental rotations per frame, both applied
+in the camera's \textbf{local space} (post-multiplication):
 \begin{itemize}
-  \item \textbf{Yaw} $\Delta\alpha$ --- rotation about the world up
-        axis $Y$.  Applied as a \emph{pre-multiplication}
-        $\mathbf{q}' = R_Y(\Delta\alpha) \, \mathbf{q}$ so the horizon
-        stays level regardless of the camera's current pitch.
+  \item \textbf{Yaw} $\Delta\alpha$ --- rotation about the camera's
+        own up axis $Y$.  Applied as a post-multiplication
+        $\mathbf{q}' = \mathbf{q} \, R_Y(\Delta\alpha)$ so the view
+        spins left/right consistently with the screen drag,
+        \emph{regardless of the camera's current orientation}.
   \item \textbf{Pitch} $\Delta\beta$ --- rotation about the camera's
-        local $X$ axis.  Applied as a \emph{post-multiplication}
+        local $X$ axis.  Applied as a post-multiplication
         $\mathbf{q}' \leftarrow \mathbf{q}' \, R_X(-\Delta\beta)$,
-        where the sign preserves the old ``drag up = look up''
+        where the sign preserves the ``drag up = look up''
         convention.
 \end{itemize}
 
 \[
   \mathbf{q}_{\text{new}}
   = \mathrm{normalize}\!\left(
-      R_Y(\Delta\alpha) \;\cdot\; \mathbf{q}_{\text{old}} \;\cdot\; R_X(-\Delta\beta)
+      \mathbf{q}_{\text{old}} \;\cdot\; R_Y(\Delta\alpha) \;\cdot\; R_X(-\Delta\beta)
     \right).
 \]
+
+\paragraph{Why local-space yaw, not world-Y.}
+The original implementation pre-multiplied the yaw rotation about the
+\emph{world} $Y$ axis ($R_Y \, \mathbf{q}$) to keep the horizon level.
+However, once the camera is rolled upside-down (e.g.\ after pitching
+past $90^\circ$), the world-$Y$ yaw rotates in the \emph{opposite}
+direction to the screen drag: dragging left turns the view right.
+Switching to local-space yaw ($\mathbf{q} \, R_Y$) makes the on-screen
+response always match the drag direction, at the cost of the horizon
+no longer staying level after a roll---an acceptable trade-off for an
+interactive inspection camera.
 
 Because quaternion multiplication is a closed, smooth operation on
 $\mathrm{SO}(3)$, no clamp is required and no singularity arises at
 any orientation.
 
 \begin{lstlisting}
-pub fn orbit(&mut self, delta_yaw: f32, delta_pitch: f32) {
-    let yaw_rot   = Quat::from_rotation_y(delta_yaw);
-    let pitch_rot = Quat::from_rotation_x(-delta_pitch);
-    self.orientation = (yaw_rot * self.orientation * pitch_rot).normalize();
+pub fn orbit(&mut self, drag_x: f32, drag_y: f32) {
+    // Horizontal drag -> yaw about the camera's own up axis.
+    // Vertical drag   -> pitch about the camera's own right axis.
+    // Negate the vertical term so dragging up raises the camera.
+    let yaw_rot   = Quat::from_rotation_y(drag_x);
+    let pitch_rot = Quat::from_rotation_x(-drag_y);
+    self.orientation = (self.orientation * yaw_rot * pitch_rot).normalize();
 }
 \end{lstlisting}
+
+The parameter names \texttt{drag\_x}/\texttt{drag\_y} (rather than
+\texttt{delta\_yaw}/\texttt{delta\_pitch}) reflect that the inputs are
+screen-space drag deltas, not angular increments---the conversion to
+rotation angle happens inside \texttt{orbit} via the caller-supplied
+sensitivity factor.
 
 The final \texttt{.normalize()} guards against floating-point drift
 after many incremental updates; it is a numerical safeguard, not a
@@ -264,11 +286,14 @@ The complete camera update pipeline per frame:
 \begin{enumerate}
   \item \textbf{Input} (\texttt{input.rs}) --- mouse drag deltas
         $(\Delta x, \Delta y)$ scaled by a sensitivity factor.
-  \item \textbf{Orbit} --- \texttt{camera.orbit($-\Delta x \cdot s$,
-        $-\Delta y \cdot s$)} composes incremental quaternion
+  \item \textbf{Orbit} (left mouse) --- \texttt{camera.orbit($-\Delta x \cdot s$,
+        $-\Delta y \cdot s$)} composes incremental local-space quaternion
         rotations.
-  \item \item \textbf{Pan} (right mouse) --- translates
-        \texttt{target} along camera-local $X$ and $Y$.
+  \item \textbf{Pan} (right mouse) --- translates \texttt{target}
+        along camera-local $X$ and $Y$.  Screen $y$ grows downward,
+        so the drag delta is negated: \texttt{pan($-\Delta x \cdot s$,
+        $-\Delta y \cdot s$)} makes the object follow the cursor
+        (drag up $\to$ object up, drag right $\to$ object right).
   \item \textbf{Zoom} (scroll) --- scales \texttt{distance} with
         clamp $[0.1, 500]$.
   \item \textbf{View matrix} --- built from

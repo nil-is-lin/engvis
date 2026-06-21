@@ -20,12 +20,14 @@ log.workspace = true
 env_logger.workspace = true
 glam.workspace = true
 fidget-core.workspace = true
+fidget-jit.workspace = true
 fidget-mesh.workspace = true
 fidget-rhai.workspace = true
 tobj.workspace = true
 stl_io.workspace = true
 ply-rs-bw.workspace = true
 rfd.workspace = true
+earcutr = "0.4"
 
 [workspace]
 resolver = "2"
@@ -33,6 +35,7 @@ members = [
     "crates/engvis-core",
     "crates/engvis-renderer",
     "fidget-demo", "examples/colorbar3d",
+    "tpms2step",
 ]
 
 [workspace.package]
@@ -55,6 +58,7 @@ env_logger = "0.11"
 gltf = "1.4"
 image = "0.25"
 fidget-core = "0.4.3"
+fidget-jit = "0.4.3"
 fidget-mesh = "0.4.3"
 fidget-rhai = "0.4.3"
 tobj = "4.0"

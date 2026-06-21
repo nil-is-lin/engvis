@@ -305,6 +305,91 @@ pub fn extract<F: FnMut(f32, f32, f32) -> f32>(
     (positions, indices)
 }
 
+/// Parallel MC33 extraction with a **pre-computed grid**.
+///
+/// This variant skips the internal grid sampling (the caller must provide
+/// the grid computed via batch evaluation) but still performs per-cell
+/// triangulation and the gradient-based winding fix.
+///
+/// The grid must be laid out as `grid[(ix * (ny+1) + iy) * (nz+1) + iz]`,
+/// matching the indexing used by [`extract_par`].
+///
+/// The closure `f` is used only for:
+/// 1. MC33 ambiguous-face resolution (`compute_mc33_subcase`) — rare.
+/// 2. Winding fix gradient (6 calls per triangle, parallelised).
+pub fn extract_par_with_grid<F: Fn(f32, f32, f32) -> f32 + Sync + Send>(
+    f: F,
+    grid: &[f32],
+    x_range: (f32, f32, usize),
+    y_range: (f32, f32, usize),
+    z_range: (f32, f32, usize),
+) -> (Vec<[f32; 3]>, Vec<u32>) {
+    use rayon::prelude::*;
+    let (x0, _x1, nx) = x_range;
+    let (y0, _y1, ny) = y_range;
+    let (z0, _z1, nz) = z_range;
+    let dx = (x_range.1 - x0) / nx as f32;
+    let dy = (y_range.1 - y0) / ny as f32;
+    let dz = (z_range.1 - z0) / nz as f32;
+
+    let sx = ny + 1;
+    let sy = nz + 1;
+
+    // Parallel per-cell triangulation.
+    let tris: Vec<[f32; 3]> = (0..nx)
+        .into_par_iter()
+        .flat_map_iter(|ix| {
+            let mut slice = Vec::new();
+            for iy in 0..ny {
+                for iz in 0..nz {
+                    let v: [[f32; 3]; 8] = [
+                        [x0 + (ix    ) as f32 * dx, y0 + (iy    ) as f32 * dy, z0 + (iz    ) as f32 * dz],
+                        [x0 + (ix + 1) as f32 * dx, y0 + (iy    ) as f32 * dy, z0 + (iz    ) as f32 * dz],
+                        [x0 + (ix + 1) as f32 * dx, y0 + (iy + 1) as f32 * dy, z0 + (iz    ) as f32 * dz],
+                        [x0 + (ix    ) as f32 * dx, y0 + (iy + 1) as f32 * dy, z0 + (iz    ) as f32 * dz],
+                        [x0 + (ix    ) as f32 * dx, y0 + (iy    ) as f32 * dy, z0 + (iz + 1) as f32 * dz],
+                        [x0 + (ix + 1) as f32 * dx, y0 + (iy    ) as f32 * dy, z0 + (iz + 1) as f32 * dz],
+                        [x0 + (ix + 1) as f32 * dx, y0 + (iy + 1) as f32 * dy, z0 + (iz + 1) as f32 * dz],
+                        [x0 + (ix    ) as f32 * dx, y0 + (iy + 1) as f32 * dy, z0 + (iz + 1) as f32 * dz],
+                    ];
+                    let vals = [
+                        grid[((ix    ) * sx + (iy    )) * sy + (iz    )],
+                        grid[((ix + 1) * sx + (iy    )) * sy + (iz    )],
+                        grid[((ix + 1) * sx + (iy + 1)) * sy + (iz    )],
+                        grid[((ix    ) * sx + (iy + 1)) * sy + (iz    )],
+                        grid[((ix    ) * sx + (iy    )) * sy + (iz + 1)],
+                        grid[((ix + 1) * sx + (iy    )) * sy + (iz + 1)],
+                        grid[((ix + 1) * sx + (iy + 1)) * sy + (iz + 1)],
+                        grid[((ix    ) * sx + (iy + 1)) * sy + (iz + 1)],
+                    ];
+                    process_cell(&mut |x, y, z| f(x, y, z), &v, &vals)
+                        .into_iter()
+                        .for_each(|(a, b, c)| {
+                            slice.push(a);
+                            slice.push(b);
+                            slice.push(c);
+                        });
+                }
+            }
+            slice
+        })
+        .collect();
+
+    let n_tri = tris.len() / 3;
+    let positions = tris;
+    let indices: Vec<u32> = (0..n_tri as u32)
+        .flat_map(|t| [t * 3, t * 3 + 1, t * 3 + 2])
+        .collect();
+
+    // NOTE: no winding fix here.  The caller runs Mesh::from_triangles,
+    // whose fix_winding does BFS local-consistency propagation plus a
+    // per-component signed-volume orientation fix.  That is robust even
+    // where the field gradient vanishes (e.g. CSG creases f²−t² at f=0),
+    // and avoids 6 expensive per-triangle field evaluations here.
+
+    (positions, indices)
+}
+
 /// Parallel variant of [`extract`] for field samplers that are `Fn + Sync`.
 /// Grid sampling and per-cell triangulation are parallelised with rayon;
 /// the winding fix remains sequential (it is cheap relative to meshing).

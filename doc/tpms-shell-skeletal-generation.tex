@@ -90,13 +90,41 @@ shell (two offset surfaces forming a hollow wall), and skeletal
 
 \subsection{Minimal Surface Mode}
 
-The default mode extracts the zero level-set directly:
+The default mode extracts an iso-level-set of the TPMS function:
 \begin{equation}
-  g(\mathbf{x}) = f(\mathbf{x}).
+  g(\mathbf{x}) = f(\mathbf{x}) - C,
 \end{equation}
+where $C$ is the iso-level parameter.  The meshed surface is
+$\{g = 0\} = \{f = C\}$.  Setting $C = 0$ recovers the classic minimal
+surface (the zero level-set); non-zero $C$ shifts the extracted sheet
+to a neighbouring iso-surface.
+
+\paragraph{Volume-fraction parameterisation.}\label{sec:vol-frac}
+Different TPMS functions have wildly different value ranges
+(e.g.\ gyroid $\in[-1.5,1.5]$, neovius $\in[-13,13]$), so a fixed
+$C$ slider range cannot cover all surfaces.  engvis therefore exposes
+a single \emph{volume fraction} parameter $\varphi\in(0,1)$ with
+uniform geometric semantics across all TPMS:
+\begin{equation}\label{eq:vol-frac}
+  \varphi \;=\; \frac{\bigl|\{\mathbf{x}\in[-1,1]^3 : f(\mathbf{x}) < C\}\bigr|}
+                     {|\text{domain}|}.
+\end{equation}
+The user sets $\varphi$; engvis internally solves for the
+corresponding $C$ via \emph{sort-based inversion}: sample $f$ on a
+$48^3$ grid, sort the values, and pick the $\varphi$-quantile.  This
+makes $\varphi=0.5$ the symmetric minimal surface for \emph{every}
+TPMS, and $\varphi\to0$/$\varphi\to1$ the fully filled/void limits.
+
 This produces a thin, open surface---the classic TPMS sheet.  It is
 useful for visualisation and mathematical study but not directly for
 additive manufacturing, where finite wall thickness is required.
+
+\paragraph{Shared $\varphi$ with skeletal mode.}
+The same $\varphi$ parameter drives both the minimal-surface level-set
+($f = C$) and the skeletal solid offset (\S\ref{sec:skeletal}).  This
+lets the user pick a visually pleasing iso-surface in minimal-surface
+mode and then switch directly to skeletal mode to cap it into a closed
+solid, without re-tuning the parameter.
 
 \subsection{Shell Mode}\label{sec:shell}
 
@@ -170,12 +198,186 @@ Euler characteristic $\chi=-38$ reflects the high genus of the gyroid
 wall (its many interconnected channels), as expected for a closed
 surface of that topology.
 
+\paragraph{Cap-face boundary smoothing via Newton projection.}
+\label{sec:snap-boundary}
+The CSG field $g = \max(f,\,\mathrm{sdf}_{\text{box}})$ makes Marching
+Cubes generate \emph{cap faces} on each box face $x/y/z = \pm c$.  The
+\emph{silhouette} of each cap region --- where the flat cap meets the
+curved TPMS surface --- is the intersection curve
+\begin{equation}
+  C \;=\; \{f = 0\} \,\cap\, \{\text{box face}\},
+\end{equation}
+a genuine geometric boundary.  MC, however, samples on a fixed 3D
+lattice and places these silhouette vertices on \emph{cell-grid
+points} rather than on $C$.  Because both free (in-face) coordinates
+are locked to the lattice, the field value $f$ at such a vertex is
+\emph{not} zero (measured $\mathrm{RMS}|f|\approx 0.043$) and
+oscillates from vertex to vertex, producing the visible staircase
+along the TPMS/box silhouette (see Fig.~\ref{fig:staircase}).  Note
+that this is distinct from the \emph{interior} cap vertices, which sit
+on the lattice with $f<0$ and correctly tessellate the flat cap.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[scale=1.8]
+  % Grid
+  \draw[gray!30, very thin] (0,0) grid (4,3);
+  % True iso-curve (smooth)
+  \draw[blue, thick, smooth] plot coordinates
+    {(0.5,0) (1.2,0.5) (2.0,1.0) (2.8,1.5) (3.5,2.0) (4,2.3)};
+  % Staircase approximation (MC vertices on cell edges)
+  \draw[red, thick] (0.5,0) -- (0.5,1) -- (1.5,1) -- (1.5,2) -- (2.5,2)
+    -- (2.5,2.5) -- (3.5,2.5) -- (3.5,3);
+  % Labels
+  \node[blue, above right] at (4,2.3) {curve $C: f{=}0$};
+  \node[red, above left] at (3.5,3) {MC staircase};
+  \node[below] at (2,-0.3) {box face (2D subspace)};
+\end{tikzpicture}
+\caption{Marching Cubes places the cap silhouette vertices on
+lattice grid points (red staircase) instead of on the true
+intersection curve $C = \{f=0\}\cap\{\text{box face}\}$ (blue).}
+\label{fig:staircase}
+\end{figure}
+
+engvis eliminates this jaggedness with a post-processing
+\textbf{Newton projection} step (\texttt{snap\_cap\_boundary\_to\_curve}):
+\begin{enumerate}[leftmargin=2em]
+  \item \emph{Identify silhouette vertices}: classify each triangle as
+        \emph{cap} (all three vertices on the same box face, same
+        sign) or \emph{TPMS}.  A silhouette vertex is one shared
+        between a cap triangle and a TPMS triangle.
+  \item \emph{Detect box features}: a silhouette vertex may sit not
+        only on a single box \emph{face} but on a box \emph{edge}
+        (two faces, e.g.\ $x = c \wedge y = c$) or \emph{corner}
+        (three faces).  These edges and corners are \emph{hard
+        geometric boundaries}: the true TPMS/box silhouette $C$ meets
+        the box edge exactly where $\{f=0\}$ crosses that edge, and
+        must be respected.  Each vertex is tagged with the set of
+        faces it lies on; the count $k\in\{1,2,3\}$ of locked axes
+        determines its remaining degrees of freedom.
+  \item \emph{Constrained Newton iteration} (dispatch on $k$):
+        \begin{itemize}
+          \item $k=3$ (\emph{corner}): the vertex is fully pinned ---
+                no projection.
+          \item $k=2$ (\emph{edge}): two coordinates are fixed at
+                $\pm c$, leaving one free axis $t$.  Solve the 1-D
+                problem $f(t)=0$ along the edge,
+                $t \leftarrow t - f/\partial_t f$, so the vertex lands
+                on $\{\text{box edge}\}\cap\{f=0\}$.
+          \item $k=1$ (\emph{face}): the box-face normal axis is fixed;
+                the remaining two axes $(u,v)$ are free.  Solve the
+                2-D problem
+                \begin{equation}
+                  \begin{pmatrix} u \\ v \end{pmatrix}
+                  \leftarrow
+                  \begin{pmatrix} u \\ v \end{pmatrix}
+                  - \alpha\,\frac{f}{\|\nabla_{\!uv} f\|^2}
+                  \begin{pmatrix} \partial_u f \\ \partial_v f \end{pmatrix},
+                \end{equation}
+                where $\nabla_{\!uv} f = (\partial_u f,\, \partial_v f)$
+                is the finite-difference gradient on the free axes.
+        \end{itemize}
+        In every case the damping factor $\alpha\le 1$ caps each step
+        at $\approx 2$ cells, and the free coordinate(s) are
+        \textbf{clamped to $[-c, c]$} after each step so the iterate
+        cannot slide along $C$ past the face/edge boundary and push
+        the mesh outside the box $[-1,1]^3$.
+  \item \emph{Accept or reject}: write back the projected position
+        only if the total displacement is finite and below
+        $\approx 3$ cells; otherwise the iterate is discarded (Newton
+        diverged or jumped to another branch of $C$), keeping the
+        original lattice vertex inside the box.
+\end{enumerate}
+
+This moves each silhouette vertex onto the \emph{exact} curve $C$ ---
+including the constrained box-edge intersections --- \emph{without}
+changing mesh topology and without ever leaving the box: the measured
+mesh bounding box is $[-c,c]^3$ with zero vertices outside, and
+$\mathrm{RMS}|f|$ drops sharply.  The
+cap triangles remain planar (all vertices keep the locked
+coordinate $\pm c$), and the TPMS triangles inherit the smoothed
+silhouette.
+
+\paragraph{Vertex splitting and topological watertightness.}
+The vertex-splitting step (\S\ref{sec:smart-normals}) intentionally
+breaks topological watertightness: boundary vertices are duplicated
+so that cap and TPMS triangles no longer share indices.  After
+splitting, the mesh has boundary edges along the TPMS/box crease.
+This is \emph{by design} --- the mesh remains geometrically closed
+(both surfaces face outward), and the split ensures correct shading
+at the crease.  The watertightness reported in
+Table~\ref{tab:shell-fragments} refers to the pre-split mesh.
+
 \paragraph{Gradient and normals.}
 The wall surface $\{f^2=\delta^2\}$ has gradient
 $\nabla(f^2-\delta^2) = 2f\,\nabla f$, which is non-degenerate on the
-surface itself (where $|f|=\delta\neq 0$).  engvis overwrites vertex
-normals with this analytic gradient, producing correct two-sided
-lighting.
+surface itself (where $|f|=\delta\neq 0$).  The outward normal is
+$\operatorname{sgn}(f)\,\nabla f / \|\nabla f\|$ (pointing away from
+the wall centre $f=0$).  engvis evaluates $f$ at each vertex and
+applies this sign correction, producing correct two-sided lighting.
+
+\paragraph{Boundary shading: vertex splitting for the C¹ crease.}
+\label{sec:smart-normals}
+When the shell field is CSG-intersected with the box solid
+($g = \max(f^2-\delta^2,\ \text{box\_sdf})$), the resulting composite
+surface has a \emph{C¹-discontinuity} along the TPMS/box boundary
+curve: the surface tangent plane jumps from the TPMS tangent to the
+flat box face.  This is a \emph{geometric} crease --- the boundary is a
+sharp edge, not a smooth blend.
+
+Assigning a single normal per vertex cannot represent this crease:
+\begin{itemize}
+  \item TPMS gradient $\nabla f$ $\to$ cap faces show spurious curvature
+        (not flat)
+  \item Face normal $\pm\hat{\mathbf{e}}$ $\to$ TPMS surface shows flat
+        patches near the edge
+  \item Averaged normal $\to$ both regions look wrong (jagged shading)
+\end{itemize}
+
+engvis therefore uses \textbf{vertex splitting} (implemented as
+\texttt{overwrite\_smart\_normals}).  Boundary vertices shared between
+cap triangles and TPMS triangles are duplicated, and each copy receives
+the normal appropriate to its triangle group:
+
+\begin{enumerate}[leftmargin=2em]
+  \item \emph{Classify triangles}: a triangle is a ``cap'' triangle if
+        all three vertices lie on the same box face (same axis, same
+        sign).  Otherwise it is a ``TPMS'' triangle.
+  \item \emph{Identify boundary vertices}: a vertex is a boundary
+        vertex if it is referenced by both cap and TPMS triangles.
+  \item \emph{Split}: for each boundary vertex, create a duplicate.
+        The original keeps its index (used by TPMS triangles); the
+        duplicate gets a new index (used by cap triangles).
+  \item \emph{Remap indices}: update cap triangle indices to point to
+        the duplicate vertices.
+  \item \emph{Assign normals}:
+    \begin{itemize}
+      \item TPMS-triangle vertices $\to$ analytic gradient
+            $\operatorname{sgn}(f)\,\nabla f / \|\nabla f\|$
+            (smooth curved shading; see below)
+      \item Cap-triangle vertices $\to$ geometric face normal
+            $\pm\hat{\mathbf{e}}$ (flat shading)
+    \end{itemize}
+\end{enumerate}
+
+\paragraph{Sign correction for shell normals.}
+For the shell surface $f^2 - \delta^2 = 0$, i.e.\ $f = \pm\delta$,
+the outward normal (pointing away from the wall centre $f=0$) is
+$\operatorname{sgn}(f)\,\nabla f$, not $\nabla f$.  On the outer
+surface ($f = +\delta$) both agree, but on the inner surface
+($f = -\delta$) the raw gradient $\nabla f$ points \emph{inward}
+(toward $f=0$), producing incorrect dark shading.  The
+\texttt{flip\_inner} flag in \texttt{overwrite\_smart\_normals}
+evaluates $f$ at each TPMS vertex and flips the gradient where
+$f < 0$, ensuring both sides of the wall are lit correctly.
+
+For skeletal mode ($f = C$), $\nabla f$ already points outward, so
+\texttt{flip\_inner} is false.
+
+This produces a clean crease at the boundary --- geometrically correct,
+visually sharp, with no jagged artefacts.  The same algorithm is
+applied to skeletal mode, where the composite field
+$\max(f-C,\ \text{box\_sdf})$ has an identical C¹-discontinuity.
 
 \subsection{Skeletal Mode}\label{sec:skeletal}
 
@@ -184,23 +386,96 @@ iso-level of the TPMS function:
 \begin{equation}\label{eq:skeletal}
   g(\mathbf{x}) = f(\mathbf{x}) - C,
 \end{equation}
-where $C$ is the iso-level offset parameter.
+where $C$ is the iso-level offset, solved from the user-facing volume
+fraction $\varphi$ as described in \S\ref{sec:vol-frac}.
 
-\paragraph{Effect of $C$.}
-When $C = 0$, this reduces to the minimal surface mode.  As $C$
-increases, the region $\{g \le 0\} = \{f \le C\}$ expands, filling
-more of the unit cell with ``solid'' material.  The resulting surface
-$f = C$ is topologically distinct from the minimal surface: instead of
-an open sheet, it forms a connected network of solid struts along the
-edges and vertices of the TPMS unit cell.
+\paragraph{Effect of $\varphi$.}
+When $\varphi = 0.5$ (i.e.\ $C$ at the median of $f$), this reduces
+to the symmetric minimal surface.  As $\varphi$ increases, the region
+$\{g \le 0\} = \{f \le C\}$ expands, filling more of the unit cell
+with ``solid'' material.  The resulting surface $f = C$ is
+topologically distinct from the minimal surface: instead of an open
+sheet, it forms a connected network of solid struts along the edges
+and vertices of the TPMS unit cell.
 
 The gradient is simply $\nabla g = \nabla f$, so surface normals are
 unaffected by the shift---a desirable property.
 
-\paragraph{Negative $C$.}
-When $C < 0$, the solid region shrinks and the void region expands.
-This produces the \emph{complementary} structure: thin channels
-instead of thick struts.
+\paragraph{Volume-fraction semantics across TPMS.}
+Because $C$ is derived from $\varphi$ (not set directly), the same
+$\varphi$ value produces comparable solid/void ratios across all
+TPMS.  For example, $\varphi=0.3$ always means ``30\% solid, 70\%
+void'', regardless of whether the TPMS is gyroid (range $[-1.5,1.5]$)
+or neovius (range $[-13,13]$).  This eliminates the need for
+per-surface $C$ range tables and makes the UI parameter
+semantically uniform.
+
+\paragraph{Skeletal mesh generation with Newton boundary smoothing.}
+\label{sec:skeletal-mesh}
+The skeletal mesh uses the same CSG-intersect approach as shell mode:
+the field $g = \max(f - C,\ \text{box\_sdf})$ is meshed with MC33,
+producing a watertight solid with cap faces on $x/y/z = \pm 1$.
+However, MC33 places cap-face boundary vertices on discrete grid
+edges, causing staircase aliasing along the TPMS/cap junction curve
+$C = \{f = C\} \cap \{\text{box face}\}$.
+
+To eliminate this aliasing, engvis applies a \emph{Newton projection}
+post-processing step (\texttt{snap\_mesh\_boundary\_to\_curve}) that
+moves junction vertices onto the smooth curve $C$:
+
+\begin{enumerate}[leftmargin=2em]
+  \item \emph{Identify junction vertices}: for each vertex, check if
+        it lies on a box face ($|x_i| \approx 1$ for some axis $i$)
+        and is near the isosurface ($|f| < 0.3$).  These are the
+        vertices where the TPMS surface meets the cap face.
+  \item \emph{Newton projection in 2D free-axis subspace}: for each
+        junction vertex, lock the face-normal axis and solve the 2D
+        problem
+        \begin{equation}
+          \begin{pmatrix} u \\ v \end{pmatrix}
+          \leftarrow
+          \begin{pmatrix} u \\ v \end{pmatrix}
+          - \frac{f}{\|\nabla_{\!uv} f\|^2}
+          \begin{pmatrix} \partial_u f \\ \partial_v f \end{pmatrix},
+        \end{equation}
+        where $(u, v)$ are the free axes on the box face.  The
+        iteration converges in $\le 24$ steps, moving the vertex onto
+        the true curve $C$.
+  \item \emph{Smart normals}: after projection, apply the smart
+        normals algorithm (\S\ref{sec:smart-normals}) to handle the
+        C$^1$ discontinuity at the TPMS/cap junction: gradient normals
+        for TPMS vertices, face normals for cap vertices, with vertex
+        splitting at the crease.
+\end{enumerate}
+
+This approach produces a smooth, watertight skeletal mesh with no
+staircase aliasing along the TPMS/cap junction, while preserving the
+topological watertightness of the CSG-intersect mesh (boundary edges
+$= 0$ before vertex splitting).
+
+\paragraph{Crease snapping for shell and skeletal-solid meshes.}
+The same staircase artefact appears wherever a CSG-intersected TPMS
+field meets a box cap face, not only in skeletal-network mode.
+\texttt{snap\_mesh\_boundary\_to\_curve} is therefore applied in all
+three crease-producing paths, with the projection field chosen to
+match the crease curve:
+\begin{itemize}[leftmargin=2em]
+  \item \emph{Shell} (\texttt{build\_shell\_mesh}): the wall surface is
+        $f^2 - (t/2)^2 = 0$, so the crease is
+        $C = \{f^2 - (t/2)^2 = 0\} \cap \{\text{box face}\}$.  The
+        snapping projects against the \emph{wall} field
+        $g_{\text{wall}} = f^2 - (t/2)^2$, not $f$ itself.
+  \item \emph{Skeletal solid} (\texttt{build\_mesh}, solid branch) and
+        the dedicated \texttt{build\_skeletal\_mesh}: the crease is
+        $C = \{f = 0\} \cap \{\text{box face}\}$, projected against the
+        TPMS field $f$.
+\end{itemize}
+Because \texttt{snap\_mesh\_boundary\_to\_curve} and
+\texttt{project\_to\_curve} are generic over the implicit shape, the
+only per-path difference is which compiled field is passed in.  The
+Newton iteration and the $\le 3\,h$ displacement guard
+($h = \text{cell size}$) reject divergent moves identically in every
+case.
 
 % =====================================================================
 \section{Thickness Calibration}\label{sec:calibration}
@@ -360,9 +635,11 @@ let k = self.tpms_period.max(1.0);     // |grad f| ~ k
 let shell_half_t = 0.5 * thickness * k; // delta
 
 let tree = match self.morphology {
-    MinimalSurface | Shell => tree,    // Shell handled below
-    Skeletal => tree - iso_level,
+    MinimalSurface => tree - iso_level, // f = C level-set
+    Shell => tree,                       // handled below
+    Skeletal => tree - iso_level,       // f = C solid
 };
+
 
 let mesh = if matches!(self.morphology, Morphology::Shell) {
     // Smooth wall solid f^2 - delta^2, box-CSG, single MC33 pass.
@@ -419,6 +696,85 @@ gradient structure as the base TPMS ($\nabla g = \nabla f$), so both
 backends produce clean results.  The skeletal mesh is a closed solid
 (box-CSG), so it uses the boundary capping described in
 Section~\ref{sec:capping}.
+
+\subsection{Async Mesh Building and Performance}\label{sec:async}
+
+High-resolution TPMS meshes (e.g.\ gyroid shell at $R=256$) can produce
+millions of triangles, and the MC33 extraction, vertex deduplication,
+and topology analysis can take several seconds.  To keep the UI
+responsive, engvis uses a \emph{background thread} for mesh building:
+
+\begin{enumerate}[leftmargin=2em]
+  \item When a parameter changes (\texttt{needs\_remesh = true}), the
+        UI thread creates an \texttt{AppBuildSnapshot} --- a clone of
+        all parameters needed for the build.
+  \item A background \texttt{thread::spawn} calls
+        \texttt{build\_scene\_result()} on the snapshot, producing a
+        \texttt{MeshBuildResult} (scene + topology + status).
+  \item The result is stored in an \texttt{Arc<Mutex<Option<...>>>}
+        shared between the UI thread and the build thread.
+  \item Each frame, the UI thread checks whether the result is ready
+        (\texttt{Some}).  If so, it swaps the scene and updates the
+        status bar.  While building, the status bar shows
+        ``\textcolor{orange}{Building mesh...}''.
+\end{enumerate}
+
+This approach avoids blocking the egui event loop, preventing the
+``not responding'' state that occurs when mesh building runs
+synchronously on the UI thread.
+
+\paragraph{Winding-fix optimisation.}
+The \texttt{fix\_winding} function's per-component volume flip
+previously iterated all faces for each negative-volume component
+($O(n_{\text{faces}} \times n_{\text{components}})$).  This is now
+$O(n_{\text{faces}})$ by building a root$\to$face-index list
+(\texttt{comp\_faces}) during the volume accumulation pass and
+iterating only over faces in negative-volume components.
+
+\paragraph{MC33 winding redundancy.}
+MC33's \texttt{extract\_par} already applies a gradient-based winding
+fix during extraction.  The previous call to \texttt{from\_triangles}
+(which runs BFS + union-find + geometric-flip detection) was
+redundant for MC33 meshes and has been replaced with
+\texttt{from\_triangles\_open}, which only performs vertex
+deduplication.  This eliminates the $O(n^2)$ geometric-flip detection
+pass on high-resolution meshes.
+
+\paragraph{Edge index deduplication.}
+The \texttt{extract\_edge\_indices} function previously stored each
+triangle's 3 edges independently, duplicating shared edges on closed
+manifolds (2$\times$ overhead).  It now uses a
+\texttt{HashSet<(u32, u32)>} to store each edge only once, halving
+the GPU edge endpoint buffer size for closed surfaces.
+
+\paragraph{Batch grid evaluation.}
+The previous implementation sampled the scalar field by calling
+\texttt{f(x, y, z)} per grid point, where each call created a new
+fidget VM evaluator.  For a resolution of $R = 256$, this meant
+$(257)^3 \approx 17\text{M}$ evaluator creations.
+
+The optimised path (\texttt{extract\_par\_with\_grid}) pre-computes
+the entire grid in a single \texttt{float\_slice\_eval} call:
+\begin{enumerate}[leftmargin=2em]
+  \item Build three coordinate arrays $\mathbf{x}, \mathbf{y},
+        \mathbf{z}$ of length $(R+1)^3$.
+  \item Call \texttt{eval.eval(\&tape, \&xs, \&ys, \&zs)} once,
+        returning all field values in a single batch.
+  \item Pass the pre-computed grid to \texttt{extract\_par\_with\_grid},
+        which skips internal sampling and proceeds directly to
+        per-cell triangulation.
+\end{enumerate}
+
+This replaces $O(R^3)$ individual evaluator creations with a single
+batch evaluation, eliminating the dominant overhead for
+high-resolution meshes.
+
+\paragraph{Parallel winding fix.}
+The gradient-based winding fix (comparing each triangle's face normal
+against $\nabla f$ at the centroid) was previously sequential.
+\texttt{extract\_par\_with\_grid} now parallelises this with
+\texttt{rayon::par\_chunks\_exact\_mut}, distributing the 6 field
+evaluations per triangle across all CPU cores.
 
 \subsection{Box-Face Capping via Boundary Loops}\label{sec:capping}
 
@@ -588,15 +944,158 @@ panel when a TPMS surface is selected:
   \item Adjust the \textbf{Period k} slider to set the spatial frequency.
   \item Choose a morphology mode:
     \begin{itemize}
-      \item \textbf{Minimal surface} ($f=0$) --- open sheet.
+      \item \textbf{Minimal surface} ($f=C$) --- open sheet.
       \item \textbf{Shell} ($|f|-\delta=0$) --- adjust \textbf{Thickness}.
-      \item \textbf{Skeletal} ($f-C=0$) --- adjust \textbf{C value}.
+      \item \textbf{Skeletal} ($f-C=0$) --- adjust \textbf{Volume fraction $\varphi$}.
     \end{itemize}
+  \item For minimal-surface and skeletal modes, adjust the
+        \textbf{Volume fraction $\varphi$} slider ($0.01$--$0.99$).
+        $\varphi=0.5$ gives the symmetric minimal surface; lower/higher
+        values shift the iso-level to fill or empty the unit cell.
   \item Click \textbf{Re-mesh} to rebuild the surface.
 \end{enumerate}
 
 The status bar at the bottom displays the current mode alongside
 topology statistics (vertex/edge/face counts, Euler characteristic,
 boundary edge count, watertightness).
+
+% =====================================================================
+\section{Performance Optimisation}\label{sec:perf}
+
+The mesh generation pipeline has been optimised to achieve interactive
+frame rates.  Table~\ref{tab:perf} shows the timing breakdown for a
+gyroid at resolution $R=96$ (shell: $121\,639$ vertices, $243\,328$
+triangles; skeletal: $36\,100$ vertices, $72\,200$ triangles).
+
+\begin{table}[h]
+\centering
+\caption{Pipeline timing (release build, Apple M-series, $R=96$).
+All times in milliseconds.}
+\label{tab:perf}
+\begin{tabular}{lcc}
+\toprule
+Stage & Shell & Skeletal \\
+\midrule
+Shape (JIT compile)   & 0    & 0  \\
+Grid build            & 2    & 0  \\
+Grid eval (JIT)       & 14   & 4  \\
+MC33 extract          & 3    & 1  \\
+Vertex dedup          & 6    & 2  \\
+Winding fix           & 28   & 6  \\
+Gradient normals      & 5    & 2  \\
+\midrule
+\textbf{Total}        & \textbf{58} & \textbf{15} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{JIT Evaluation}\label{sec:jit}
+
+The Fidget implicit-function evaluator was migrated from the
+stack-based VM (\texttt{VmFunction}) to the JIT compiler
+(\texttt{JitFunction}).  For a $97^3$ grid ($912\,673$ points), this
+reduced evaluation time from $452$\,ms to $14$\,ms --- a
+$\mathbf{32\times}$ speedup.  The JIT compiles the expression tree to
+native machine code once, then evaluates all grid points in a single
+batched \texttt{float\_slice\_eval} call.
+
+\subsection{Sort-Based Vertex Deduplication}\label{sec:dedup}
+
+Vertex deduplication merges coincident vertices at octree resolution
+boundaries.  The previous \texttt{HashMap}-based approach allocated a
+bucket per vertex and probed neighbours, costing $\sim 113$\,ms for
+$121\,639$ vertices.
+
+The optimised algorithm (\texttt{dedup\_vertices} in
+\texttt{mesh.rs}) uses a \emph{sort-and-group} strategy:
+\begin{enumerate}[leftmargin=2em]
+  \item \emph{Parallel key generation}: for each vertex, compute a
+        spatial hash key by quantising coordinates to the dedup
+        tolerance $\varepsilon$ and packing into a \texttt{u64}:
+        \begin{equation}
+          h(\mathbf{p}) = \bigl(\lfloor x/\varepsilon \rceil + 2^{20}\bigr)
+                        \,\big|\,\bigl(\lfloor y/\varepsilon \rceil + 2^{20}\bigr) \ll 21
+                        \,\big|\,\bigl(\lfloor z/\varepsilon \rceil + 2^{20}\bigr) \ll 42.
+        \end{equation}
+  \item \emph{Parallel sort}: sort the $(h, \text{idx})$ pairs by
+        key using Rayon's \texttt{par\_sort\_unstable\_by\_key}.
+  \item \emph{Sequential grouping}: scan the sorted array; vertices
+        with the same key are candidates for merging.  For each
+        candidate, verify the actual Euclidean distance
+        $d^2 < \varepsilon^2$ (to avoid hash-collision false positives)
+        before merging.
+  \item \emph{Parallel index remap}: rewrite all triangle indices
+        using the remap table, in parallel.
+  \item \emph{Parallel degenerate removal}: flag triangles with
+        repeated indices ($a=b \vee b=c \vee a=c$) for removal, in
+        parallel; compact the index buffer sequentially.
+\end{enumerate}
+This reduced dedup time from $113$\,ms to $6$\,ms --- a
+$\mathbf{19\times}$ speedup --- by eliminating per-vertex
+\texttt{HashMap} allocations and improving cache locality through
+sorted access.
+
+\subsection{Parity Union-Find for Winding Correction}\label{sec:parity-uf}
+
+Winding correction ensures all triangles face outward consistently.
+The previous approach used BFS traversal across face adjacency
+(separate from a Union-Find for component counting), costing
+$\sim 235$\,ms for $243\,328$ triangles.
+
+The optimised algorithm (\texttt{fix\_winding} in \texttt{mesh.rs})
+uses a single \emph{Parity Union-Find} that simultaneously computes
+winding consistency and connected components:
+\begin{enumerate}[leftmargin=2em]
+  \item \emph{Edge adjacency}: build a hash map from edge key
+        $(\min(a,b), \max(a,b)) \to [(face, direction)]$ using
+        \texttt{FxHashMap} for fast hashing.
+  \item \emph{Parity Union-Find}: each face has a parity bit (0/1)
+        relative to its root.  When two faces $f_a, f_b$ share an edge,
+        compute the \emph{edge parity} $p_e = (dir_a == dir_b)$ (1 if
+        inconsistent).  Union the two components, setting the link
+        parity so that
+        \begin{equation}
+          parity(f_a \to f_b) = p_a \oplus parity[r_b] \oplus p_b = p_e.
+        \end{equation}
+  \item \emph{Path compression}: the \texttt{find} function performs
+        two-pass path compression, rewiring each node to point directly
+        to the root and updating its parity accordingly.
+  \item \emph{Flip}: after all unions, flip faces with parity 1
+        relative to their root.
+  \item \emph{Signed volume}: compute per-component signed volume
+        (parallel via Rayon \texttt{fold/reduce}); flip components
+        with negative volume.
+\end{enumerate}
+This reduced winding-fix time from $235$\,ms to $28$\,ms --- a
+$\mathbf{8.4\times}$ speedup --- by eliminating the separate BFS pass
+and leveraging path compression for near-constant-time amortised
+\texttt{find} operations.
+
+\subsection{Topology Computation}\label{sec:topo}
+
+The \texttt{compute\_topology} function was optimised by migrating
+from \texttt{std::HashMap<(u32,u32), Vec<usize>} to
+\texttt{FxHashMap<u64, Vec<usize>}, using a packed \texttt{u64} key
+for faster hashing.  Topology computation is now optional
+(enabled by the \texttt{ENGVIS\_TOPO} environment variable) and
+skipped in normal interactive use, saving $\sim 22$\,ms per remesh.
+
+\subsection{Selftest Mode}\label{sec:selftest}
+
+The \texttt{-{}-selftest} CLI flag runs an automated test suite that
+validates:
+\begin{itemize}
+  \item \textbf{TPMS value ranges}: samples each TPMS on a $64^3$
+        grid and reports $[\min, \max]$ and $\operatorname{vol\_frac}(C=0)$.
+  \item \textbf{Volume-fraction solver}: for $\varphi \in \{0.3, 0.5, 0.7\}$,
+        solves $C$ and verifies the meshed iso-surface has
+        $\operatorname{mean}|f-C| < 0.001$.
+  \item \textbf{Skeletal topology}: $V=36\,100$, $F=72\,200$,
+        $\chi=0$, boundary edges $=0$.
+  \item \textbf{Shell topology}: $V=121\,639$, $F=243\,328$,
+        $\chi=-51$, boundary edges $=52$ (pre-split).
+  \item \textbf{Timing}: per-stage millisecond breakdown for
+        grid build, eval, extract, dedup, winding fix, normals.
+\end{itemize}
 
 \end{document}

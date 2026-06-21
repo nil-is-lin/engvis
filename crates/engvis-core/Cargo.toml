@@ -14,3 +14,4 @@ repository = "https://github.com/nil-is-lin/engvis"
 glam.workspace = true
 bytemuck.workspace = true
 rayon.workspace = true
+rustc-hash = "2"

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use crate::mesh::Mesh;
 
 /// Result of a topological analysis of a triangle mesh.
@@ -50,15 +50,21 @@ pub fn compute_topology(mesh: &Mesh) -> MeshTopology {
     let v = mesh.vertices.len();
     let f = mesh.indices.len() / 3;
 
-    // edge → list of face indices sharing this edge
-    let mut edge_faces: HashMap<(u32, u32), Vec<usize>> = HashMap::with_capacity(f * 3);
+    // edge → list of face indices sharing this edge.
+    // Use u64 key for faster hashing than (u32, u32) tuple.
+    let mut edge_faces: FxHashMap<u64, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(f * 3, Default::default());
     for (fi, tri) in mesh.indices.chunks_exact(3).enumerate() {
         let a = tri[0];
         let b = tri[1];
         let c = tri[2];
         for &(i0, i1) in &[(a, b), (b, c), (c, a)] {
-            let key = if i0 <= i1 { (i0, i1) } else { (i1, i0) };
-            edge_faces.entry(key).or_default().push(fi);
+            let key = if i0 <= i1 {
+                (i0 as u64) | ((i1 as u64) << 32)
+            } else {
+                (i1 as u64) | ((i0 as u64) << 32)
+            };
+            edge_faces.entry(key).or_insert_with(|| Vec::with_capacity(2)).push(fi);
         }
     }
 
@@ -68,14 +74,14 @@ pub fn compute_topology(mesh: &Mesh) -> MeshTopology {
     let mut parent: Vec<usize> = (0..f).collect();
     let mut rank: Vec<u32> = vec![0; f];
 
-    fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
             parent[x] = parent[parent[x]];
             x = parent[x];
         }
         x
     }
-    fn union(parent: &mut Vec<usize>, rank: &mut Vec<u32>, mut a: usize, mut b: usize) {
+    fn union(parent: &mut [usize], rank: &mut [u32], mut a: usize, mut b: usize) {
         a = find(parent, a);
         b = find(parent, b);
         if a == b { return; }

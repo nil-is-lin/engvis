@@ -81,21 +81,27 @@ impl OrbitCamera {
         self.projection_matrix() * self.view_matrix()
     }
 
-    /// Orbit by incremental rotation.
+    /// Orbit by an incremental screen-space drag.
     ///
-    /// `delta_yaw`   — rotation around world up (Y), keeps the horizon level.
-    /// `delta_pitch` — rotation around the camera's local right axis (tilt).
+    /// `drag_x` — horizontal drag; rotates around the camera's local up
+    ///            axis (Y), so dragging left/right spins the view
+    ///            left/right on screen.
+    /// `drag_y` — vertical drag; rotates around the camera's local right
+    ///            axis (X), tilting the view up/down.
     ///
-    /// Both are applied as incremental quaternion multiplications, so there
-    /// is no gimbal lock and no pitch clamp — the camera can rotate freely.
-    pub fn orbit(&mut self, delta_yaw: f32, delta_pitch: f32) {
-        // Yaw: pre-multiply (world-space rotation around Y)
-        let yaw_rot = Quat::from_rotation_y(delta_yaw);
-        // Pitch: post-multiply (local-space rotation around camera X).
-        // Negate so that positive delta_pitch raises the camera, matching
-        // the old Euler convention where pitch > 0 = camera above target.
-        let pitch_rot = Quat::from_rotation_x(-delta_pitch);
-        self.orientation = (yaw_rot * self.orientation * pitch_rot).normalize();
+    /// Both deltas are converted to incremental quaternion rotations and
+    /// post-multiplied in **local space**, so the on-screen response is
+    /// always consistent regardless of orientation (no world-Y reversal
+    /// when the view tips past the pole).  There is no gimbal lock and no
+    /// pitch clamp — the camera rotates freely.
+    pub fn orbit(&mut self, drag_x: f32, drag_y: f32) {
+        // Horizontal drag → yaw about the camera's own up axis.
+        // Vertical drag   → pitch about the camera's own right axis.
+        // Negate the vertical term so dragging up raises the camera,
+        // matching the conventional "drag up = look up" feel.
+        let yaw_rot = Quat::from_rotation_y(drag_x);
+        let pitch_rot = Quat::from_rotation_x(-drag_y);
+        self.orientation = (self.orientation * yaw_rot * pitch_rot).normalize();
     }
 
     /// Pan the target point in camera-local XY

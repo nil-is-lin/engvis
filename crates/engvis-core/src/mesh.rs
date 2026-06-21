@@ -40,82 +40,95 @@ pub struct Mesh {
 /// octree resolution boundaries.  This function remaps the index buffer
 /// so that co-located vertices collapse to a single index.
 pub fn dedup_vertices(positions: &mut Vec<[f32; 3]>, indices: &mut Vec<u32>, eps: f32) {
-    use std::collections::HashMap;
+    use rayon::prelude::*;
 
     let inv = 1.0 / eps;
-    // Spatial hash: quantise each coordinate to an integer grid
-    let hash_pos = |p: [f32; 3]| -> (i64, i64, i64) {
-        (
-            (p[0] * inv).round() as i64,
-            (p[1] * inv).round() as i64,
-            (p[2] * inv).round() as i64,
-        )
+    // Pack quantised (x, y, z) into a single u64 key for faster hashing.
+    // Each coordinate is offset to non-negative and packed into 21 bits
+    // (range 0..2_097_151), which is ample for MC grids up to ~1000³.
+    let hash_pos = |p: [f32; 3]| -> u64 {
+        let x = (p[0] * inv).round() as i64;
+        let y = (p[1] * inv).round() as i64;
+        let z = (p[2] * inv).round() as i64;
+        // Offset to non-negative (add 1<<20 to handle ±524287 range).
+        ((x + (1 << 20)) as u64)
+            | (((y + (1 << 20)) as u64) << 21)
+            | (((z + (1 << 20)) as u64) << 42)
     };
 
-    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
-    let mut remap = vec![0u32; positions.len()];
+    let n = positions.len();
+    // Sort-based dedup: build (key, orig_idx) pairs, sort by key,
+    // then group consecutive same-key entries.  This avoids HashMap
+    // overhead and is more cache-friendly for large meshes.
+    let mut keyed: Vec<(u64, u32)> = (0..n)
+        .into_par_iter()
+        .map(|i| (hash_pos(positions[i]), i as u32))
+        .collect();
+    keyed.par_sort_unstable_by_key(|e| e.0);
 
-    let mut new_positions: Vec<[f32; 3]> = Vec::new();
-
-    for (i, &pos) in positions.iter().enumerate() {
-        let key = hash_pos(pos);
-        let mut found = None;
-
-        // Check the 3×3×3 neighbourhood for an existing vertex
-        for dz in -1..=1 {
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    let nk = (key.0 + dx, key.1 + dy, key.2 + dz);
-                    if let Some(bucket) = grid.get(&nk) {
-                        for &j in bucket {
-                            let op = new_positions[j];
-                            let d = (pos[0] - op[0]).powi(2)
-                                + (pos[1] - op[1]).powi(2)
-                                + (pos[2] - op[2]).powi(2);
-                            if d.sqrt() < eps {
-                                found = Some(j as u32);
-                                break;
-                            }
-                        }
-                    }
-                    if found.is_some() { break; }
-                }
-                if found.is_some() { break; }
-            }
-            if found.is_some() { break; }
-        }
-
-        match found {
-            Some(j) => { remap[i] = j; }
-            None => {
-                let j = new_positions.len() as u32;
-                remap[i] = j;
+    let mut remap = vec![0u32; n];
+    let mut new_positions: Vec<[f32; 3]> = Vec::with_capacity(n);
+    // For each group of same-key vertices, check distance to the
+    // group's first vertex.  If within eps, remap to it; otherwise
+    // create a new vertex.  Groups are typically 1-2 entries for MC.
+    let mut i = 0;
+    while i < n {
+        let key = keyed[i].0;
+        let group_start = i;
+        while i < n && keyed[i].0 == key { i += 1; }
+        // First vertex in group → always new.
+        let first_orig = keyed[group_start].1 as usize;
+        let new_idx = new_positions.len() as u32;
+        new_positions.push(positions[first_orig]);
+        remap[first_orig] = new_idx;
+        // Remaining vertices in group: check distance to first.
+        for j in (group_start + 1)..i {
+            let orig_idx = keyed[j].1 as usize;
+            let pos = positions[orig_idx];
+            let op = new_positions[new_idx as usize];
+            let d2 = (pos[0] - op[0]).powi(2)
+                + (pos[1] - op[1]).powi(2)
+                + (pos[2] - op[2]).powi(2);
+            if d2 < eps * eps {
+                remap[orig_idx] = new_idx;
+            } else {
+                let ni = new_positions.len() as u32;
                 new_positions.push(pos);
-                grid.entry(key).or_default().push(j as usize);
+                remap[orig_idx] = ni;
             }
         }
     }
 
     let old_len = positions.len();
     *positions = new_positions;
-    for idx in indices.iter_mut() {
+    // Parallel index remapping.
+    indices.par_iter_mut().for_each(|idx| {
         *idx = remap[*idx as usize];
-    }
+    });
 
     // Remove degenerate triangles (any two indices identical → zero area).
     // dedup can collapse two vertices of the same triangle into one,
     // producing sliver triangles that pass topology checks but render
     // as visual artifacts (lines/spikes).
+    // Parallel: mark valid triangles, then compact.
     let old_tris = indices.len() / 3;
+    let keep: Vec<bool> = (0..old_tris)
+        .into_par_iter()
+        .map(|t| {
+            let base = t * 3;
+            let a = indices[base];
+            let b = indices[base + 1];
+            let c = indices[base + 2];
+            a != b && b != c && a != c
+        })
+        .collect();
     let mut write = 0;
-    for read in (0..indices.len()).step_by(3) {
-        let a = indices[read];
-        let b = indices[read + 1];
-        let c = indices[read + 2];
-        if a != b && b != c && a != c {
-            indices[write] = a;
-            indices[write + 1] = b;
-            indices[write + 2] = c;
+    for t in 0..old_tris {
+        if keep[t] {
+            let base = t * 3;
+            indices[write] = indices[base];
+            indices[write + 1] = indices[base + 1];
+            indices[write + 2] = indices[base + 2];
             write += 3;
         }
     }
@@ -147,110 +160,192 @@ pub fn dedup_vertices(positions: &mut Vec<[f32; 3]>, indices: &mut Vec<u32>, eps
 /// Call this on the raw `(positions, indices)` pair before constructing
 /// a [`Mesh`], or after any operation that may introduce winding defects.
 pub fn fix_winding(positions: &[[f32; 3]], indices: &mut [u32]) {
-    use std::collections::{HashMap, VecDeque};
+    use rustc_hash::FxHashMap;
+    use rayon::prelude::*;
 
     let n_faces = indices.len() / 3;
     if n_faces == 0 { return; }
 
-    fn tri_edges(idx: &[u32], fi: usize) -> [(u32, u32); 3] {
-        let t = &idx[fi * 3..fi * 3 + 3];
-        [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
-    }
+    // Pack edge (a, b) into a u64 key for faster hashing.
+    let edge_key = |a: u32, b: u32| -> u64 {
+        let lo = a.min(b) as u64;
+        let hi = a.max(b) as u64;
+        (hi << 32) | lo
+    };
 
-    // ── Build edge → face adjacency ──────────────────────────
-    let mut edge_faces: HashMap<(u32, u32), Vec<usize>> =
-        HashMap::with_capacity(n_faces * 3);
+    let _t_adj = std::time::Instant::now();
+    // ── Build edge → [(face, direction)] adjacency ──────────
+    // For each edge, store (face_idx, is_forward) where is_forward = 1
+    // if the face traverses the edge as (lo→hi).  Two faces sharing an
+    // edge are consistent iff their is_forward values differ.
+    let mut edge_faces: FxHashMap<u64, Vec<(usize, u8)>> =
+        FxHashMap::with_capacity_and_hasher(n_faces * 3, Default::default());
     for (fi, tri) in indices.chunks_exact(3).enumerate() {
         for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
-            let key = (a.min(b), a.max(b));
-            edge_faces.entry(key).or_default().push(fi);
+            let key = edge_key(a, b);
+            let is_forward = (a < b) as u8;
+            edge_faces.entry(key).or_insert_with(|| Vec::with_capacity(2)).push((fi, is_forward));
         }
     }
+    let _dt_adj = _t_adj.elapsed();
 
-    // ── 1. BFS local winding consistency ────────────────────
-    let mut visited = vec![false; n_faces];
-    let mut bfs_flipped = 0usize;
-    for seed in 0..n_faces {
-        if visited[seed] { continue; }
-        visited[seed] = true;
-        let mut queue = VecDeque::from([seed]);
-        while let Some(fi) = queue.pop_front() {
-            for &(src, dst) in &tri_edges(indices, fi) {
-                let key = (src.min(dst), src.max(dst));
-                if let Some(neighbors) = edge_faces.get(&key) {
-                    for &ni in neighbors {
-                        if ni == fi || visited[ni] { continue; }
-                        let ni_edges = tri_edges(indices, ni);
-                        if ni_edges.iter().any(|e| *e == (src, dst)) {
-                            indices.swap(ni * 3 + 1, ni * 3 + 2);
-                            bfs_flipped += 1;
-                        }
-                        visited[ni] = true;
-                        queue.push_back(ni);
-                    }
-                }
+    let _t_uf = std::time::Instant::now();
+    // ── Parity Union-Find: winding consistency + components ──
+    // Each face has a parity (0 or 1) relative to its root.  parity 1
+    // means the face needs to be flipped to match the root's orientation.
+    // This replaces BFS traversal with a single union-find pass.
+    let mut parent: Vec<usize> = (0..n_faces).collect();
+    let mut parity: Vec<u8> = vec![0; n_faces];
+    let mut rank = vec![0u32; n_faces];
+
+    // find with path compression: returns (root, parity_from_x_to_root).
+    fn find(par: &mut [usize], par_par: &mut [u8], x: usize) -> (usize, u8) {
+        // Pass 1: find root and total parity from x to root.
+        let mut root = x;
+        let mut total_parity = 0u8;
+        while par[root] != root {
+            total_parity ^= par_par[root];
+            root = par[root];
+        }
+        // Pass 2: path compression — rewire each node to point directly
+        // to root, updating its parity accordingly.
+        let mut cur = x;
+        let mut acc = 0u8; // parity from original x to cur
+        while par[cur] != root {
+            let next = par[cur];
+            let next_acc = acc ^ par_par[cur];
+            par_par[cur] = total_parity ^ acc; // parity(cur → root)
+            par[cur] = root;
+            acc = next_acc;
+            cur = next;
+        }
+        (root, total_parity)
+    }
+
+    for faces in edge_faces.values() {
+        if faces.len() < 2 { continue; }
+        let (fa, fa_fwd) = faces[0];
+        for &(fb, fb_fwd) in &faces[1..] {
+            // edge_parity = 1 if faces are inconsistent (same direction)
+            let edge_parity = (fa_fwd == fb_fwd) as u8;
+
+            let (ra, pa) = find(&mut parent, &mut parity, fa);
+            let (rb, pb) = find(&mut parent, &mut parity, fb);
+            if ra == rb { continue; }
+
+            // Union by rank; set parity between roots so that
+            // parity(fa→fb) = pa ^ parity[rb] ^ pb = edge_parity.
+            let link_parity = pa ^ pb ^ edge_parity;
+            if rank[ra] < rank[rb] {
+                parent[ra] = rb;
+                parity[ra] = link_parity;
+            } else if rank[ra] > rank[rb] {
+                parent[rb] = ra;
+                parity[rb] = link_parity;
+            } else {
+                parent[rb] = ra;
+                parity[rb] = link_parity;
+                rank[ra] += 1;
             }
         }
     }
+    let _dt_uf = _t_uf.elapsed();
 
-    // ── 2. Union-Find component detection ───────────────────
-    let mut parent: Vec<usize> = (0..n_faces).collect();
-    let mut rank = vec![0u32; n_faces];
-    fn find(par: &mut [usize], mut x: usize) -> usize {
-        while par[x] != x { par[x] = par[par[x]]; x = par[x]; }
-        x
-    }
-    fn union(par: &mut [usize], rnk: &mut [u32], mut a: usize, mut b: usize) {
-        a = find(par, a); b = find(par, b);
-        if a == b { return; }
-        match rnk[a].cmp(&rnk[b]) {
-            std::cmp::Ordering::Less    => { par[a] = b; }
-            std::cmp::Ordering::Greater => { par[b] = a; }
-            std::cmp::Ordering::Equal   => { par[b] = a; rnk[a] += 1; }
+    // ── Flip faces with parity 1 (relative to root) ─────────
+    let _t_flip = std::time::Instant::now();
+    let mut bfs_flipped = 0usize;
+    for fi in 0..n_faces {
+        let (_, p) = find(&mut parent, &mut parity, fi);
+        if p == 1 {
+            indices.swap(fi * 3 + 1, fi * 3 + 2);
+            bfs_flipped += 1;
         }
     }
-    for faces in edge_faces.values() {
-        for i in 1..faces.len() {
-            union(&mut parent, &mut rank, faces[0], faces[i]);
+    let _dt_flip = _t_flip.elapsed();
+
+    let _t_vol = std::time::Instant::now();
+    // ── Per-component signed volume → flip inward comps ──────
+    // Flatten roots to contiguous indices [0, n_comps).
+    let mut root_id: Vec<usize> = vec![usize::MAX; n_faces];
+    let mut n_comps = 0usize;
+    for fi in 0..n_faces {
+        let (r, _) = find(&mut parent, &mut parity, fi);
+        if root_id[r] == usize::MAX {
+            root_id[r] = n_comps;
+            n_comps += 1;
         }
+        root_id[fi] = root_id[r];
     }
 
-    // ── 3. Per-component signed volume → flip inward comps ──
-    let mut comp_volume: HashMap<usize, f64> = HashMap::new();
-    for (fi, tri) in indices.chunks_exact(3).enumerate() {
-        let root = find(&mut parent, fi);
-        let p0 = glam::DVec3::from(glam::Vec3::from(positions[tri[0] as usize]));
-        let p1 = glam::DVec3::from(glam::Vec3::from(positions[tri[1] as usize]));
-        let p2 = glam::DVec3::from(glam::Vec3::from(positions[tri[2] as usize]));
-        *comp_volume.entry(root).or_default() += p0.dot(p1.cross(p2));
+    // Parallel per-face signed volume, accumulated per component.
+    let comp_vol: Vec<f64> = {
+        let partials: Vec<Vec<f64>> = (0..n_faces)
+            .into_par_iter()
+            .fold(
+                || vec![0.0_f64; n_comps],
+                |mut local, fi| {
+                    let tri = &indices[fi * 3..fi * 3 + 3];
+                    let p0 = glam::DVec3::from(glam::Vec3::from(positions[tri[0] as usize]));
+                    let p1 = glam::DVec3::from(glam::Vec3::from(positions[tri[1] as usize]));
+                    let p2 = glam::DVec3::from(glam::Vec3::from(positions[tri[2] as usize]));
+                    local[root_id[fi]] += p0.dot(p1.cross(p2));
+                    local
+                },
+            )
+            .collect();
+        let mut total = vec![0.0_f64; n_comps];
+        for p in &partials {
+            for (c, &v) in p.iter().enumerate() {
+                total[c] += v;
+            }
+        }
+        total
+    };
+
+    // Build comp → faces list for flipping.
+    let mut comp_faces: Vec<Vec<usize>> = vec![Vec::new(); n_comps];
+    for fi in 0..n_faces {
+        comp_faces[root_id[fi]].push(fi);
     }
 
     let mut comps_flipped = 0usize;
-    let n_comps = comp_volume.len();
-    for (&root, &vol) in &comp_volume {
+    for (c, &vol) in comp_vol.iter().enumerate() {
         if vol < 0.0 {
-            for fi in 0..n_faces {
-                if find(&mut parent, fi) == root {
-                    indices.swap(fi * 3 + 1, fi * 3 + 2);
-                }
+            for &fi in &comp_faces[c] {
+                indices.swap(fi * 3 + 1, fi * 3 + 2);
             }
             comps_flipped += 1;
         }
     }
+    let _dt_vol = _t_vol.elapsed();
     eprintln!(
-        "  winding: bfs_flipped={} components={} comps_flipped={}",
-        bfs_flipped, n_comps, comps_flipped
+        "  winding: bfs_flipped={} components={} comps_flipped={} | adj={:.0}ms uf={:.0}ms flip={:.0}ms vol={:.0}ms",
+        bfs_flipped, n_comps, comps_flipped,
+        _dt_adj.as_secs_f64()*1e3, _dt_uf.as_secs_f64()*1e3,
+        _dt_flip.as_secs_f64()*1e3, _dt_vol.as_secs_f64()*1e3,
     );
 }
 
 impl Mesh {
-    /// Extract edge indices from triangle indices for edge (line) rendering.
-    /// For each triangle (i0, i1, i2), generates 3 edges: (i0, i1), (i1, i2), (i2, i0).
+    /// Extract unique edge indices from triangle indices for edge (line) rendering.
+    ///
+    /// For each triangle (i0, i1, i2), generates 3 edges: (i0, i1), (i1, i2),
+    /// (i2, i0).  Edges shared between adjacent triangles are stored only
+    /// once (deduplicated by sorted vertex pair), which halves the buffer
+    /// size for closed manifolds and avoids exceeding GPU buffer limits on
+    /// high-resolution meshes.
     pub fn extract_edge_indices(&self) -> Vec<u32> {
-        let mut edge_indices = Vec::with_capacity(self.indices.len() * 2);
+        use std::collections::HashSet;
+        let mut seen: HashSet<(u32, u32)> = HashSet::new();
+        let mut edge_indices = Vec::with_capacity(self.indices.len());
         for tri in self.indices.chunks(3) {
             if tri.len() == 3 {
-                edge_indices.extend_from_slice(&[tri[0], tri[1], tri[1], tri[2], tri[2], tri[0]]);
+                for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    if seen.insert(key) {
+                        edge_indices.extend_from_slice(&[a, b]);
+                    }
+                }
             }
         }
         edge_indices
@@ -381,69 +476,20 @@ impl Mesh {
         let eps = diag * 1e-6;
 
         // Merge duplicate vertices at octree resolution boundaries
+        let _t_dedup = std::time::Instant::now();
         dedup_vertices(&mut positions, &mut indices, eps);
+        let _dt_dedup = _t_dedup.elapsed();
 
         // Fix winding inconsistencies
+        let _t_wind = std::time::Instant::now();
         if run_winding_fix {
             fix_winding(&positions, &mut indices);
         }
+        let _dt_wind = _t_wind.elapsed();
+        eprintln!("    [from_tri timing] dedup={:.0}ms fix_winding={:.0}ms",
+            _dt_dedup.as_secs_f64()*1e3, _dt_wind.as_secs_f64()*1e3);
 
         let n_verts = positions.len();
-
-        // ── Fix geometric flips from dedup ────────────────────
-        // dedup_vertices can move merged vertices, causing individual
-        // faces' geometric normals to flip while their topological
-        // winding stays consistent with neighbours.  Such faces are
-        // culled by back-face culling, producing holes.  Detect them
-        // by comparing each face normal against the average of its
-        // vertices' neighbours' normals, and flip the winding of
-        // faces that disagree.
-        if run_winding_fix {
-            // First pass: compute per-face normals.
-            let nf = indices.len() / 3;
-            let mut face_normals: Vec<glam::Vec3> = Vec::with_capacity(nf);
-            for tri in indices.chunks_exact(3) {
-                let p0 = glam::Vec3::from(positions[tri[0] as usize]);
-                let p1 = glam::Vec3::from(positions[tri[1] as usize]);
-                let p2 = glam::Vec3::from(positions[tri[2] as usize]);
-                face_normals.push((p1 - p0).cross(p2 - p0));
-            }
-
-            // Build vertex → face adjacency.
-            let mut vert_faces: Vec<Vec<usize>> = vec![Vec::new(); n_verts];
-            for (fi, tri) in indices.chunks_exact(3).enumerate() {
-                for &idx in tri {
-                    vert_faces[idx as usize].push(fi);
-                }
-            }
-
-            // For each face, compare its normal against the average of
-            // adjacent face normals.  If anti-parallel, flip winding.
-            let mut to_flip: Vec<usize> = Vec::new();
-            for (fi, tri) in indices.chunks_exact(3).enumerate() {
-                let n = face_normals[fi];
-                if n.length_squared() < 1e-16 { continue; }
-                let n = n.normalize();
-
-                // Collect neighbour face normals.
-                let mut ref_sum = glam::Vec3::ZERO;
-                for &idx in tri {
-                    for &nf in &vert_faces[idx as usize] {
-                        if nf != fi {
-                            ref_sum += face_normals[nf];
-                        }
-                    }
-                }
-                if ref_sum.length_squared() < 1e-12 { continue; }
-
-                if n.dot(ref_sum) < 0.0 {
-                    to_flip.push(fi);
-                }
-            }
-            for &fi in &to_flip {
-                indices.swap(fi * 3 + 1, fi * 3 + 2);
-            }
-        }
 
         // ── Smooth normals (area-weighted) ─────────────────────
         let mut smooth_normals = vec![[0.0_f32; 3]; n_verts];
