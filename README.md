@@ -4,7 +4,69 @@
 
 ## 项目简介
 
-engvis是一个用Rust编写的工程可视化框架，专为工程应用设计。它提供了完整的3D渲染管线，支持glTF模型加载、PBR材质渲染、灵活的相机控制和丰富的UI界面。
+engvis 是一个以**三周期极小曲面 (Triply Periodic Minimal Surface, TPMS)** 为核心的工程可视化框架，基于 Rust 和 wgpu 构建。TPMS 是一类在三维空间中无限周期延伸、平均曲率为零的曲面，广泛应用于增材制造、生物支架、热交换器和轻量化结构设计。
+
+## 三周期极小曲面 (TPMS)
+
+### 数学定义
+
+三周期极小曲面定义为光滑函数 $f: \mathbb{R}^3 \to \mathbb{R}$ 的零等值面：
+
+$$\mathcal{S} = \{\ \mathbf{x} \in \mathbb{R}^3 \ |\ f(\mathbf{x}) = 0 \ \}$$
+
+该曲面将空间划分为 $f>0$ 和 $f<0$ 两个区域，形成双连续的三维网络结构。
+
+### 支持曲面 (11 种)
+
+| 曲面 | 隐式方程 $f(kx, ky, kz) = 0$ |
+|---|---|
+| **Gyroid** | $\sin x \cos y + \sin y \cos z + \sin z \cos x$ |
+| **Schwarz P** | $\cos x + \cos y + \cos z$ |
+| **Schwarz D** | $\sin x \sin y \sin z + \sin x \cos y \cos z + \cos x \sin y \cos z + \cos x \cos y \sin z$ |
+| **Schoen IWP** | $2(\cos x \cos y + \cos y \cos z + \cos z \cos x) - (\cos 2x + \cos 2y + \cos 2z)$ |
+| **Neovius** | $3(\cos x + \cos y + \cos z) + 4 \cos x \cos y \cos z$ |
+| **F-RD** | $4 \cos x \cos y \cos z - (\cos 2x \cos 2y + \cos 2y \cos 2z + \cos 2z \cos 2x)$ |
+| **Lidinoid** | $\frac{1}{2}[...] - \frac{1}{2}[...] + 0.15$ |
+| **Split-P** | $1.1[...] - 0.2[...] - 0.4[...]$ |
+| **Fischer-Koch S** | $\cos 2x \sin y \cos z + \cos 2y \sin z \cos x + \cos 2z \sin x \cos y$ |
+| **Fischer-Koch Y** | $2 \cos x \cos y \cos z + \sin 2x \sin y + \sin 2y \sin z + \sin 2z \sin x$ |
+| **Fischer-Koch CP** | $\cos x + \cos y + \cos z + 4 \cos x \cos y \cos z$ |
+
+### 三种形态模式
+
+| 模式 | 方程 | 描述 |
+|---|---|---|
+| **Minimal Surface** | $f(\mathbf{x}) = 0$ | 经典极小曲面——开放薄片 |
+| **Shell** | $f^2 - \delta^2 \le 0$ | 厚壁空心结构，材料覆盖在极小曲面两侧 |
+| **Skeletal** | $f(\mathbf{x}) - C = 0$ | 固态支柱网络，等值面偏移 |
+
+**Shell 模式**采用光滑场 $g = f^2 - \delta^2$（而非 $|f| - \delta$），避免了 $C^1$ 尖点，保证 Marching Cubes 在近零区域正确拼接。壁厚 $t$ 通过 $\delta = \frac{1}{2} t k$ 映射为物理几何厚度。
+
+**Skeletal 模式**通过体积分数 $\varphi \in (0, 1)$ 参数化：用户在 UI 中设置 $\varphi$，程序通过二分查找求解对应的等值面偏移 $C$，使 $|\{\mathbf{x} : f(\mathbf{x}) < C\}| / |\text{domain}| = \varphi$。同一 $\varphi$ 值在所有 TPMS 上具有一致的固/空比语义（$\varphi = 0.5$ 始终对应对称极小曲面）。
+
+### 多晶胞域扩展
+
+支持三个维度的独立晶胞堆叠数 $(n_x, n_y, n_z)$，总晶胞数为 $n_x \times n_y \times n_z$。内在周期 $k$ 控制单个晶胞内的空间频率（Gyroid 默认 $k=4$，多数为 $k=3$，Fischer-Koch 为 $k=2$）。
+
+### 网格生成
+
+- **MC33 (Marching Cubes 33)**：规则网格采样，自适应分辨率（1-512），Shell 模式最少 96³
+- **Dual Contouring (DC)**：自适应八叉树，可调深度，保留尖锐特征
+- **JIT 编译求值**：通过 [Fidget](https://github.com/nil-is-lin/fidget) 将隐式曲面的表达式树编译为平台原生代码，实时采样性能媲美手写函数
+- **边界封闭 (Boundary Capping)**：Shell 和 Skeletal 网格通过 CSG 与包围盒相交，结合边界环扇形补面算法生成无边界边的封闭实体
+- **Newton 投影**：Skeletal 模式下将交界顶点投影到 TPMS 与盒子面的精确交线上，消除阶梯锯齿
+- **异步构建**：高分辨率网格在后台线程构建，保持 UI 响应
+
+### 交互式参数调整
+
+在右侧 Source 面板中可实时调整：
+- 曲面选择（下拉菜单，显示隐式方程）
+- 周期 $k$（1-10 滑块）
+- 各方向晶胞数 $n_x, n_y, n_z$（1-10 滑块）
+- 形态模式（MinimalSurface / Shell / Skeletal）
+- Shell 模式下壁厚 $t$
+- Skeletal 模式下的体积分数 $\varphi$（以及求解后的 $C$ 值显示）
+- 网格分辨率与后端选择
 
 ## 主要特性
 
@@ -63,7 +125,7 @@ engvis/
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/engvis.git
+git clone https://github.com/nil-is-lin/engvis.git
 cd engvis
 
 # 运行程序
