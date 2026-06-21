@@ -38,7 +38,7 @@ impl GridRenderer {
             label: Some("Grid Object Bind Group Layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -55,8 +55,8 @@ impl GridRenderer {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        // Pack as { model: mat4, normal_matrix: mat4 } same as ObjectUniforms
-        let uniform_data: [[f32; 4]; 8] = [
+        // Pack as { model: mat4, normal_matrix: mat4, background_color: vec4 }
+        let uniform_data: [[f32; 4]; 9] = [
             identity_matrix[0],
             identity_matrix[1],
             identity_matrix[2],
@@ -65,12 +65,13 @@ impl GridRenderer {
             identity_matrix[1],
             identity_matrix[2],
             identity_matrix[3],
+            [1.0, 1.0, 1.0, 0.0], // default white background
         ];
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Grid Object Uniform Buffer"),
             contents: bytemuck::cast_slice(&uniform_data),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -170,35 +171,42 @@ impl GridRenderer {
         render_pass.draw(0..self.vertex_count, 0..1);
     }
 
+    /// Update the background colour reference held in the object uniform
+    /// buffer so the fragment shader can adapt grid-line visibility.
+    pub fn update_background_color(&self, queue: &wgpu::Queue, color: [f32; 3]) {
+        let offset = 8 * std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress;
+        queue.write_buffer(&self.uniform_buffer, offset, bytemuck::cast_slice(&[[color[0], color[1], color[2], 0.0_f32]]));
+    }
+
     fn generate_grid_vertices() -> (Vec<GridVertex>, u32) {
         let mut vertices = Vec::new();
 
         let grid_half = 25;
         let major_every = 5;
 
-        // Grid lines on XZ plane
+        // Grid lines on XY plane (Z = 0)
         for i in -grid_half..=grid_half {
             let is_major = i % major_every == 0;
-            let alpha = if is_major { 0.4 } else { 0.15 };
-            let color = [0.5, 0.5, 0.5, alpha];
+            let alpha = if is_major { 0.4 } else { 0.2 };
+            let color = [0.4, 0.4, 0.4, alpha];
 
             let fi = i as f32;
-            // Line along Z at x = fi
+            // Line along Y at x = fi
             vertices.push(GridVertex {
-                position: [fi, 0.0, -grid_half as f32],
+                position: [fi, -grid_half as f32, 0.0],
                 color,
             });
             vertices.push(GridVertex {
-                position: [fi, 0.0, grid_half as f32],
+                position: [fi, grid_half as f32, 0.0],
                 color,
             });
-            // Line along X at z = fi
+            // Line along X at y = fi
             vertices.push(GridVertex {
-                position: [-grid_half as f32, 0.0, fi],
+                position: [-grid_half as f32, fi, 0.0],
                 color,
             });
             vertices.push(GridVertex {
-                position: [grid_half as f32, 0.0, fi],
+                position: [grid_half as f32, fi, 0.0],
                 color,
             });
         }
@@ -216,11 +224,11 @@ impl GridRenderer {
         // Y axis (green)
         vertices.push(GridVertex {
             position: [0.0, 0.0, 0.0],
-            color: [0.2, 1.0, 0.2, 0.9],
+            color: [0.1, 0.65, 0.1, 0.9],
         });
         vertices.push(GridVertex {
             position: [0.0, grid_half as f32, 0.0],
-            color: [0.2, 1.0, 0.2, 0.9],
+            color: [0.1, 0.65, 0.1, 0.9],
         });
 
         // Z axis (blue)
@@ -249,6 +257,7 @@ struct SceneUniforms {
 struct ObjectUniforms {
     model: mat4x4<f32>,
     normal_matrix: mat4x4<f32>,
+    background_color: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> scene: SceneUniforms;
@@ -275,7 +284,10 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return in.color;
+    let bg_lum = dot(object.background_color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    // Brighter background -> increase grid alpha so lines stay visible.
+    let alpha = in.color.a * (1.0 + bg_lum * 2.5);
+    return vec4<f32>(in.color.rgb, alpha);
 }
 "#
         .to_string()

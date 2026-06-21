@@ -3,6 +3,7 @@
 // with boundary smoothing and MS-loop visualization.
 
 mod mesh_io;
+mod formula_cache;
 
 use engvis_core::{
     material::PbrMaterial,
@@ -183,11 +184,11 @@ fn tpms_formula(name: &str) -> &str {
         "gyroid"          => "sin(kx)cos(ky) + sin(ky)cos(kz) + sin(kz)cos(kx) = 0",
         "schwarz-p"       => "cos(kx) + cos(ky) + cos(kz) = 0",
         "schwarz-d"       => "sin(kx)sin(ky)sin(kz) + sin(kx)cos(ky)cos(kz)\n  + cos(kx)sin(ky)cos(kz) + cos(kx)cos(ky)sin(kz) = 0",
-        "schoen-iwp"      => "2[cos(kx)cos(ky)+cos(ky)cos(kz)+cos(kz)cos(kx)]\n  − [cos(2kx)+cos(2ky)+cos(2kz)] = 0",
+        "schoen-iwp"      => "2[cos(kx)cos(ky)+cos(ky)cos(kz)+cos(kz)cos(kx)]\n  - [cos(2kx)+cos(2ky)+cos(2kz)] = 0",
         "neovius"         => "3[cos(kx)+cos(ky)+cos(kz)] + 4cos(kx)cos(ky)cos(kz) = 0",
-        "f-rd"            => "4cos(kx)cos(ky)cos(kz) − [cos(2kx)cos(2ky)\n  + cos(2ky)cos(2kz) + cos(2kz)cos(2kx)] = 0",
-        "lidinoid"        => "½[sin(2kx)cos(ky)sin(kz) + …]\n  − ½[cos(2kx)cos(2ky) + …] + 0.15 = 0",
-        "split-p"         => "1.1[sin(2kx)cos(ky)sin(kz) + …]\n  − 0.2[cos(2kx)cos(2ky) + …]\n  − 0.4[cos(2kx)+cos(2ky)+cos(2kz)] = 0",
+        "f-rd"            => "4cos(kx)cos(ky)cos(kz) - [cos(2kx)cos(2ky)\n  + cos(2ky)cos(2kz) + cos(2kz)cos(2kx)] = 0",
+        "lidinoid"        => "(1/2)[sin(2kx)cos(ky)sin(kz) + ...]\n  - (1/2)[cos(2kx)cos(2ky) + ...] + 0.15 = 0",
+        "split-p"         => "1.1[sin(2kx)cos(ky)sin(kz) + ...]\n  - 0.2[cos(2kx)cos(2ky) + ...]\n  - 0.4[cos(2kx)+cos(2ky)+cos(2kz)] = 0",
         "fischer-koch-s"  => "cos(2kx)sin(ky)cos(kz) + cos(2ky)sin(kz)cos(kx)\n  + cos(2kz)sin(kx)cos(ky) = 0",
         "fischer-koch-y"  => "2cos(kx)cos(ky)cos(kz) + sin(2kx)sin(ky)\n  + sin(2ky)sin(kz) + sin(2kz)sin(kx) = 0",
         "fischer-koch-cp" => "cos(kx)+cos(ky)+cos(kz) + 4cos(kx)cos(ky)cos(kz) = 0",
@@ -262,7 +263,7 @@ fn classify_boundary_edges(mesh: &Mesh, tag: &str) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MeshBackend { MarchingCubes33, DualContouring }
 
-fn build_dc_mesh(tree: fidget_core::context::Tree, name: &str, depth: u8) -> Mesh {
+fn build_dc_mesh(tree: fidget_core::context::Tree, name: &str, depth: u8) -> (Mesh, String) {
     use fidget_core::shape::Shape;
     use fidget_jit::JitFunction;
     use fidget_mesh::{Octree, Settings};
@@ -282,12 +283,7 @@ fn build_dc_mesh(tree: fidget_core::context::Tree, name: &str, depth: u8) -> Mes
         .iter()
         .flat_map(|t| [t.x as u32, t.y as u32, t.z as u32])
         .collect();
-    eprintln!(
-        "  [DC] {} verts, {} tris (depth={})",
-        pos.len(),
-        idx.len() / 3,
-        depth
-    );
+    let stats = format!("[DC] {} verts, {} tris (depth={})", pos.len(), idx.len() / 3, depth);
 
     // Step 1: Fix DC winding holes via full pipeline (dedup + BFS +
     // geometric flip fix).  This must happen BEFORE smooth_boundary_ms,
@@ -304,18 +300,14 @@ fn build_dc_mesh(tree: fidget_core::context::Tree, name: &str, depth: u8) -> Mes
     // is already correct from step 2).
     let mut mesh = Mesh::from_triangles_open(name, &pos, &idx);
     overwrite_normals_with_gradient(&shape, &mut mesh);
-    mesh
+    (mesh, stats)
 }
 
 // =====================================================================
 // 2b. Marching Cubes 33 — boundary naturally smooth
 // =====================================================================
 
-fn build_mc33_mesh(tree: fidget_core::context::Tree, name: &str, res: usize) -> Mesh {
-    build_mc33_mesh_domain(tree, name, res, [1.0, 1.0, 1.0])
-}
-
-/// Like [`build_mc33_mesh`] but samples the axis-aligned box
+/// Samples the axis-aligned box
 /// `[-sx,sx] × [-sy,sy] × [-sz,sz]` where `extent = [sx, sy, sz]`.
 ///
 /// For `extent = [1,1,1]` this is the classic unit cube.  Larger
@@ -327,7 +319,7 @@ fn build_mc33_mesh_domain(
     name: &str,
     res: usize,
     extent: [f32; 3],
-) -> Mesh {
+) -> (Mesh, String) {
     use fidget_core::shape::Shape;
     use fidget_jit::JitFunction;
 
@@ -418,20 +410,15 @@ fn build_mc33_mesh_domain(
     let is_unit = (extent[0] - 1.0).abs() < 1e-6
                && (extent[1] - 1.0).abs() < 1e-6
                && (extent[2] - 1.0).abs() < 1e-6;
+    let mut out_of_bounds = 0usize;
     if is_unit {
-        let mut out_of_bounds = 0usize;
         for p in &mut pos {
             for v in &mut *p {
                 if *v < -1.0 { *v = -1.0; out_of_bounds += 1; }
                 if *v >  1.0 { *v =  1.0; out_of_bounds += 1; }
             }
         }
-        if out_of_bounds > 0 {
-            eprintln!("  [MC33] clamped {} vertex coordinates to [-1,1]", out_of_bounds);
-        }
     }
-    eprintln!("  [MC33] {} verts, {} tris (res={})",
-        pos.len(), idx.len() / 3, res);
 
     // extract_par's gradient-based winding fix uses the (possibly
     // composite) field's gradient, which can be zero at CSG creases
@@ -444,14 +431,20 @@ fn build_mc33_mesh_domain(
     let t_norm = std::time::Instant::now();
     overwrite_normals_with_gradient(&shape, &mut mesh);
     let dt_norm = t_norm.elapsed();
-    eprintln!(
-        "  [MC33 timing] shape={:.0}ms grid_build={:.0}ms eval={:.0}ms extract={:.0}ms from_triangles={:.0}ms normals={:.0}ms",
+    let clamped_msg = if is_unit && out_of_bounds > 0 {
+        format!(" | clamped {} coords", out_of_bounds)
+    } else {
+        String::new()
+    };
+    let stats = format!(
+        "[MC33] {} verts, {} tris (res={}){} | shape={:.0}ms grid={:.0}ms eval={:.0}ms extract={:.0}ms mesh={:.0}ms normals={:.0}ms",
+        pos.len(), idx.len() / 3, res, clamped_msg,
         dt_shape.as_secs_f64() * 1e3,
         dt_build.as_secs_f64() * 1e3, dt_eval.as_secs_f64() * 1e3,
         dt_extract.as_secs_f64() * 1e3, dt_mesh.as_secs_f64() * 1e3,
         dt_norm.as_secs_f64() * 1e3,
     );
-    mesh
+    (mesh, stats)
 }
 
 /// Used after `clip_mesh_to_ball` which creates new vertices with
@@ -775,7 +768,7 @@ fn build_shell_mesh(
     clip_to_unit_ball: bool,
     clip_radius: f32,
     domain_extent: [f32; 3],
-) -> Mesh {
+) -> (Mesh, String) {
     use fidget_core::context::Tree as T;
 
     let [sx, sy, sz] = domain_extent;
@@ -792,24 +785,16 @@ fn build_shell_mesh(
     // CSG-intersect with the box.
     let wall = tree.square() - half_t * half_t;
     let field = wall.max(box_sdf);
-    let mut mesh = build_mc33_mesh_domain(field, name, res, mc_extent);
+    let (mut mesh, mc33_stats) = build_mc33_mesh_domain(field, name, res, mc_extent);
 
     if clip_to_unit_ball {
         clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], clip_radius);
-        eprintln!("  [clip] {} verts, {} tris after ball clip (r={})",
-            mesh.vertices.len(), mesh.indices.len() / 3, clip_radius);
+        let clip_msg = format!(" | clip({}v/{}t)", mesh.vertices.len(), mesh.indices.len() / 3);
         recompute_smooth_normals(&mut mesh);
+        (mesh, format!("{mc33_stats}{clip_msg}"))
+    } else {
+        (mesh, mc33_stats)
     }
-
-    if std::env::var("ENGVIS_TOPO").is_ok() {
-        let topo = engvis_core::topology::compute_topology(&mesh);
-        eprintln!(
-            "  [shell] V={} F={} | χ={} boundary_edges={} components={} watertight={}",
-            mesh.vertices.len(), mesh.indices.len() / 3,
-            topo.euler, topo.boundary_edges, topo.connected_components, topo.is_watertight,
-        );
-    }
-    mesh
 }
 fn build_mesh(
     tree: fidget_core::context::Tree,
@@ -821,13 +806,13 @@ fn build_mesh(
     clip_radius: f32,
     morphology: Morphology,
     domain_extent: [f32; 3],
-) -> Mesh {
+) -> (Mesh, String) {
     let [sx, sy, sz] = domain_extent;
     let max_extent = sx.max(sy).max(sz).max(1.0);
     let pad = 4.0 / mc_res as f32;
 
     let is_solid = matches!(morphology, Morphology::Skeletal);
-    let mesh = if is_solid {
+    let (mut mesh, gen_stats) = if is_solid {
         use fidget_core::context::Tree as T;
         let half = max_extent + pad;
         let cell = 2.0 * half / (mc_res as f32 * half).ceil();
@@ -849,22 +834,14 @@ fn build_mesh(
                 build_mc33_mesh_domain(tree.clone(), name, mc_res, mc_extent),
         }
     };
-    let mut mesh = mesh;
     if clip_to_unit_ball {
         clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], clip_radius);
-        eprintln!("  [clip] {} verts, {} tris after ball clip (r={})",
-            mesh.vertices.len(), mesh.indices.len() / 3, clip_radius);
+        let clip_msg = format!(" | clip({}v/{}t)", mesh.vertices.len(), mesh.indices.len() / 3);
         recompute_smooth_normals(&mut mesh);
+        (mesh, format!("{gen_stats}{clip_msg}"))
+    } else {
+        (mesh, gen_stats)
     }
-    if is_solid {
-        let topo = engvis_core::topology::compute_topology(&mesh);
-        eprintln!(
-            "  [solid] V={} F={} | χ={} boundary_edges={} components={} watertight={}",
-            mesh.vertices.len(), mesh.indices.len() / 3,
-            topo.euler, topo.boundary_edges, topo.connected_components, topo.is_watertight,
-        );
-    }
-    mesh
 }
 
 // =====================================================================
@@ -1285,6 +1262,14 @@ struct App {
 
     // ── surface appearance ──
     surface_color: [f32; 3],
+    /// PBR metallic factor (0 = dielectric, 1 = metal).
+    surface_metallic: f32,
+    /// PBR roughness factor (0 = mirror, 1 = fully rough).
+    surface_roughness: f32,
+    /// Environment / IBL intensity multiplier.
+    env_intensity: f32,
+    /// Background clear color (RGB, each channel 0..1).
+    background_color: [f32; 3],
 
     // ── workflow / UI ──
     current_step: Step,
@@ -1299,11 +1284,16 @@ struct App {
     last_topology: Option<engvis_core::topology::MeshTopology>,
     last_build_ok: bool,
 
+    // ── formula SVG texture cache ──
+    formula_cache: formula_cache::FormulaCache,
+
     // ── async mesh building ──
     /// Background mesh build result (None = idle or building).
     mesh_build_result: Option<Arc<Mutex<Option<MeshBuildResult>>>>,
     /// Human-readable build status for the status bar.
     build_status: String,
+    /// Detailed build statistics (verts/tris/timing) for the status bar.
+    build_stats: String,
 }
 
 /// Cloneable snapshot of the App state needed for mesh building.
@@ -1331,6 +1321,8 @@ struct AppBuildSnapshot {
     show_bounding: bool,
     show_surface_edges: bool,
     surface_color: [f32; 3],
+    surface_metallic: f32,
+    surface_roughness: f32,
     wireframe_color: [f32; 3],
     wireframe_line_width: f32,
 }
@@ -1357,6 +1349,8 @@ impl AppBuildSnapshot {
             show_bounding: app.show_bounding,
             show_surface_edges: app.show_surface_edges,
             surface_color: app.surface_color,
+            surface_metallic: app.surface_metallic,
+            surface_roughness: app.surface_roughness,
             wireframe_color: app.wireframe_color,
             wireframe_line_width: app.wireframe_line_width,
         }
@@ -1403,6 +1397,7 @@ impl AppBuildSnapshot {
                     build_ok: false,
                     error: Some(e),
                     c_value: 0.0,
+                    build_stats: String::new(),
                 };
             }
         };
@@ -1475,7 +1470,7 @@ impl AppBuildSnapshot {
         } else {
             [1.0, 1.0, 1.0]
         };
-        let mesh = if matches!(self.morphology, Morphology::Shell) {
+        let (mesh, build_stats) = if matches!(self.morphology, Morphology::Shell) {
             build_shell_mesh(
                 tree.clone(), shell_half_t, &label, effective_res,
                 self.clip_to_unit_ball, self.clip_radius, domain_extent,
@@ -1493,8 +1488,8 @@ impl AppBuildSnapshot {
         let mat = PbrMaterial {
             name: "Surface".into(),
             albedo: [self.surface_color[0], self.surface_color[1], self.surface_color[2], 1.0],
-            metallic: 0.6,
-            roughness: 0.3,
+            metallic: self.surface_metallic,
+            roughness: self.surface_roughness,
             ..Default::default()
         };
         let mut scene = Scene::single_mesh(&label, mesh, mat);
@@ -1521,6 +1516,7 @@ impl AppBuildSnapshot {
                 mesh_index: Some(mi),
                 children: Vec::new(),
                 visible: true,
+                render_surface: true,
                 render_edges: false,
                 edge_color_override: None,
                 edge_width_override: None,
@@ -1550,6 +1546,7 @@ impl AppBuildSnapshot {
                 mesh_index: Some(wi),
                 children: Vec::new(),
                 visible: true,
+                render_surface: false,
                 render_edges: true,
                 edge_color_override: Some(self.wireframe_color),
                 edge_width_override: Some(self.wireframe_line_width),
@@ -1562,6 +1559,7 @@ impl AppBuildSnapshot {
             build_ok: true,
             error: None,
             c_value,
+            build_stats,
         }
     }
 }
@@ -1574,6 +1572,8 @@ struct MeshBuildResult {
     error: Option<String>,
     /// 由体积分数 φ 求解得到的 C 值（仅 MinimalSurface/Skeletal 有意义）。
     c_value: f32,
+    /// Human-readable build statistics for the status bar.
+    build_stats: String,
 }
 
 impl App {
@@ -1679,15 +1679,11 @@ impl EngvisApp for App {
                 } else {
                     self.custom_error = None;
                     self.build_status = "ready".into();
+                    self.build_stats = result.build_stats;
                 }
                 *frame.scene = result.scene;
-                // Adapt clip planes for the new scene size without
-                // resetting camera position / orientation.
-                let aabb = frame.scene.compute_aabb();
-                if aabb.is_valid() {
-                    frame.camera.near = 0.001;
-                    frame.camera.far = (aabb.diagonal() * 5.0).max(100.0);
-                }
+                // Fit camera to new scene bounds.
+                frame.camera.fit_to_scene(frame.scene);
                 *frame.scene_dirty = true;
             }
         }
@@ -1770,6 +1766,8 @@ impl EngvisApp for App {
         frame.render_state.edge_opts.enabled = true;
         frame.render_state.edge_opts.color = self.edge_color;
         frame.render_state.edge_opts.line_width = self.edge_line_width;
+        frame.render_state.background_color = self.background_color;
+        frame.render_state.env_intensity = self.env_intensity;
         if !self.camera_fitted {
             frame.camera.fit_to_scene(frame.scene);
             self.camera_fitted = true;
@@ -1779,28 +1777,28 @@ impl EngvisApp for App {
         egui::TopBottomPanel::top("menu_bar").show(egui_ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open mesh… (OBJ/STL/PLY/glTF)").clicked() {
+                    if ui.button("Open mesh... (OBJ/STL/PLY/glTF)").clicked() {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter("Mesh", &["obj", "stl", "ply", "gltf", "glb"])
                             .pick_file() { self.pending_load = Some(p); }
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Save current mesh as OBJ…").clicked() {
+                    if ui.button("Save current mesh as OBJ...").clicked() {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter("OBJ", &["obj"])
                             .set_file_name("mesh.obj").save_file()
                         { self.pending_save = Some(p); }
                         ui.close();
                     }
-                    if ui.button("Save current mesh as STL…").clicked() {
+                    if ui.button("Save current mesh as STL...").clicked() {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter("STL", &["stl"])
                             .set_file_name("mesh.stl").save_file()
                         { self.pending_save = Some(p); }
                         ui.close();
                     }
-                    if ui.button("Save current mesh as PLY…").clicked() {
+                    if ui.button("Save current mesh as PLY...").clicked() {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter("PLY", &["ply"])
                             .set_file_name("mesh.ply").save_file()
@@ -1822,7 +1820,7 @@ impl EngvisApp for App {
                         .on_hover_text("Re-mesh to apply");
                 });
                 ui.menu_button("Help", |ui| {
-                    ui.label("engvis — Engineering Visualization");
+                    ui.label("engvis - Engineering Visualization");
                     ui.label("Implicit surfaces (Fidget) + DC / MC33 meshing.");
                     ui.label("Custom expression syntax: Rhai (x, y, z, sin, cos, ...).");
                 });
@@ -1839,7 +1837,7 @@ impl EngvisApp for App {
                 } else if self.last_build_ok {
                     if let Some(t) = &self.last_topology {
                         ui.label(format!(
-                            "V={}  E={}  F={}  χ={}  ∂E={}  comps={}  watertight={}",
+                            "V={}  E={}  F={}  chi={}  dE={}  comps={}  watertight={}",
                             t.vertices, t.edges, t.faces, t.euler,
                             t.boundary_edges, t.connected_components, t.is_watertight,
                         ));
@@ -1849,6 +1847,10 @@ impl EngvisApp for App {
                 } else {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80),
                         "build failed (see expression panel)");
+                }
+                if !self.build_stats.is_empty() {
+                    ui.separator();
+                    ui.label(&self.build_stats);
                 }
                 ui.separator();
                 ui.label(format!("FPS {:.0}", frame.fps));
@@ -1887,7 +1889,7 @@ impl EngvisApp for App {
                 }
                 ui.add_space(12.0);
                 ui.separator();
-                ui.label("Click a step → edit details on the right.");
+                ui.label("Click a step -> edit details on the right.");
             });
 
         // ── Right "details" panel ──────────────────────────────────
@@ -1895,7 +1897,7 @@ impl EngvisApp for App {
             .resizable(true).default_width(320.0)
             .show(egui_ctx, |ui| {
                 match self.current_step {
-                    Step::Source    => self.ui_source(ui),
+                    Step::Source    => self.ui_source(ui, egui_ctx),
                     Step::Mesh      => self.ui_mesh(ui),
                     Step::Display   => self.ui_display(ui, frame.render_state),
                     Step::Topology  => self.ui_topology(ui),
@@ -1911,7 +1913,7 @@ impl EngvisApp for App {
 }
 
 impl App {
-    fn ui_source(&mut self, ui: &mut egui::Ui) {
+    fn ui_source(&mut self, ui: &mut egui::Ui, egui_ctx: &egui::Context) {
         ui.heading("1. Source");
         ui.label("Implicit surface f(x,y,z) = 0.");
         ui.add_space(6.0);
@@ -1982,91 +1984,161 @@ impl App {
         if matches!(&self.source, SurfaceSource::BuiltIn(n)
             if TPMS_SURFACES.iter().any(|(k,_)| k == n))
         {
-            ui.indent("tpms_opts", |ui| {
-                ui.label("Implicit equation:");
-                let formula = tpms_formula(self.selected_tpms);
-                ui.code(formula);
-                if ui.add(egui::Slider::new(&mut self.tpms_period, 1.0..=10.0)
-                    .text("Period k")).changed() {
-                    self.needs_remesh = true;
-                }
-                if ui.add(egui::Slider::new(&mut self.tpms_cells[0], 1.0..=10.0)
-                    .text("Unit cells nx").step_by(1.0)).changed() {
-                    self.needs_remesh = true;
-                }
-                if ui.add(egui::Slider::new(&mut self.tpms_cells[1], 1.0..=10.0)
-                    .text("Unit cells ny").step_by(1.0)).changed() {
-                    self.needs_remesh = true;
-                }
-                if ui.add(egui::Slider::new(&mut self.tpms_cells[2], 1.0..=10.0)
-                    .text("Unit cells nz").step_by(1.0)).changed() {
-                    self.needs_remesh = true;
-                }
-                let total = self.tpms_cells[0] * self.tpms_cells[1]
-                    * self.tpms_cells[2];
-                ui.label(format!("Total cells: {:.0} × {:.0} × {:.0} = {:.0}",
+            ui.add_space(4.0);
+
+            // ── Formula card ─────────────────────────────────
+            let frame_fill = ui.visuals().widgets.noninteractive.bg_fill;
+            egui::Frame::new()
+                .fill(frame_fill)
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    if let Some(tex) = self.formula_cache.get(egui_ctx, self.selected_tpms) {
+                        let size = tex.size_vec2();
+                        let max_w = ui.available_width().max(240.0);
+                        let scale = (max_w / size.x).min(1.0);
+                        ui.image(egui::load::SizedTexture::new(
+                            tex.id(),
+                            egui::vec2(size.x * scale, size.y * scale),
+                        ));
+                    } else {
+                        ui.code(tpms_formula(self.selected_tpms));
+                    }
+                });
+
+            ui.add_space(6.0);
+
+            // ── Parameters (Grid-aligned) ─────────────────────
+            egui::Grid::new("tpms_params")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Period k");
+                    if ui.add(egui::Slider::new(&mut self.tpms_period, 1.0..=10.0)).changed() {
+                        self.needs_remesh = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Cells x");
+                    if ui.add(egui::Slider::new(&mut self.tpms_cells[0], 1.0..=10.0)
+                        .step_by(1.0)).changed() {
+                        self.needs_remesh = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Cells y");
+                    if ui.add(egui::Slider::new(&mut self.tpms_cells[1], 1.0..=10.0)
+                        .step_by(1.0)).changed() {
+                        self.needs_remesh = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Cells z");
+                    if ui.add(egui::Slider::new(&mut self.tpms_cells[2], 1.0..=10.0)
+                        .step_by(1.0)).changed() {
+                        self.needs_remesh = true;
+                    }
+                    ui.end_row();
+                });
+            let total = self.tpms_cells[0] * self.tpms_cells[1] * self.tpms_cells[2];
+            ui.label(egui::RichText::new(
+                format!("{:.0} x {:.0} x {:.0} = {:.0} cells",
                     self.tpms_cells[0], self.tpms_cells[1],
-                    self.tpms_cells[2], total));
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label("Morphology:");
-                let mut morph = self.morphology;
-                if ui.radio_value(&mut morph, Morphology::MinimalSurface,
-                    "Minimal surface  (f = C)").changed() {
+                    self.tpms_cells[2], total))
+                .small().color(ui.visuals().weak_text_color()));
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            // ── Morphology ────────────────────────────────────
+            ui.label(egui::RichText::new("Morphology").strong());
+            ui.add_space(2.0);
+            let mut morph = self.morphology;
+            ui.horizontal(|ui| {
+                if ui.radio_value(&mut morph, Morphology::MinimalSurface, "Minimal").changed() {
                     self.morphology = morph; self.needs_remesh = true;
                 }
-                if ui.radio_value(&mut morph, Morphology::Shell,
-                    "Shell  (f² − (t/2)² = 0)").changed() {
+                if ui.radio_value(&mut morph, Morphology::Shell, "Shell").changed() {
                     self.morphology = morph; self.needs_remesh = true;
                 }
-                if ui.radio_value(&mut morph, Morphology::Skeletal,
-                    "Skeletal  (f − C = 0)").changed() {
+                if ui.radio_value(&mut morph, Morphology::Skeletal, "Skeletal").changed() {
                     self.morphology = morph; self.needs_remesh = true;
                 }
+            });
+            ui.add_space(2.0);
+
+            // Morphology formula + parameters
+            ui.indent("morph_detail", |ui| {
+                let morph_key = match self.morphology {
+                    Morphology::MinimalSurface => "morph-minimal",
+                    Morphology::Shell => "morph-shell",
+                    Morphology::Skeletal => "morph-skeletal",
+                };
+                if let Some(tex) = self.formula_cache.get(egui_ctx, morph_key) {
+                    let size = tex.size_vec2();
+                    let scale = 0.6;
+                    ui.image(egui::load::SizedTexture::new(
+                        tex.id(),
+                        egui::vec2(size.x * scale, size.y * scale),
+                    ));
+                }
+                ui.add_space(2.0);
                 match self.morphology {
                     Morphology::Shell => {
                         if ui.add(egui::Slider::new(&mut self.tpms_thickness,
-                            0.02..=0.5).text("Wall thickness")).changed() {
+                            0.02..=0.5).text("Wall t")).changed() {
                             self.needs_remesh = true;
                         }
-                        ui.label(format!(
-                            "  geometric wall thickness = {:.3}", self.tpms_thickness));
                     }
                     Morphology::Skeletal => {
                         if ui.add(egui::Slider::new(&mut self.tpms_vol_frac,
-                            0.01..=0.99).text("Volume fraction φ")).changed() {
+                            0.01..=0.99).text("Vol frac")).changed() {
                             self.needs_remesh = true;
                         }
-                        ui.label(format!(
-                            "  C = {:+.4}  (φ → C via sort-based inversion)",
-                            self.cached_c_value));
+                        ui.label(egui::RichText::new(
+                            format!("C = {:+.4}", self.cached_c_value))
+                            .small().color(ui.visuals().weak_text_color()));
                     }
-                    Morphology::MinimalSurface => {
-                        ui.label("  f = 0  (classic minimal surface)");
-                    }
+                    Morphology::MinimalSurface => {}
                 }
             });
         }
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
         ui.separator();
-        ui.label("Custom expression (Rhai):");
-        let resp = ui.add(egui::TextEdit::multiline(&mut self.custom_expr)
-            .desired_rows(3).code_editor());
-        if resp.lost_focus() && resp.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            self.source = SurfaceSource::Custom;
-            self.needs_remesh = true;
-        }
-        if ui.button("Use custom expression").clicked() {
-            self.source = SurfaceSource::Custom;
-            self.needs_remesh = true;
-        }
+        // ── Custom expression ─────────────────────────────────
+        ui.label(egui::RichText::new("Custom expression (Rhai)").strong());
+        ui.horizontal(|ui| {
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.custom_expr)
+                .code_editor());
+            if resp.lost_focus() && resp.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                self.source = SurfaceSource::Custom;
+                self.needs_remesh = true;
+            }
+            if ui.button("Apply").clicked() {
+                self.source = SurfaceSource::Custom;
+                self.needs_remesh = true;
+            }
+        });
         if let Some(err) = &self.custom_error {
             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
         }
-        ui.label("Examples:");
-        ui.code("x*x + y*y + z*z - 0.64");
-        ui.code("sin(4*x)*cos(4*y) + sin(4*y)*cos(4*z) + sin(4*z)*cos(4*x)");
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("e.g.").small().color(ui.visuals().weak_text_color()));
+            if ui.link("sphere").clicked() {
+                self.custom_expr = "x*x + y*y + z*z - 0.64".into();
+                self.source = SurfaceSource::Custom;
+                self.needs_remesh = true;
+            }
+            ui.label(egui::RichText::new("|").small());
+            if ui.link("gyroid").clicked() {
+                self.custom_expr = "sin(4*x)*cos(4*y) + sin(4*y)*cos(4*z) + sin(4*z)*cos(4*x)".into();
+                self.source = SurfaceSource::Custom;
+                self.needs_remesh = true;
+            }
+        });
 
         ui.add_space(8.0);
         ui.separator();
@@ -2122,6 +2194,12 @@ impl App {
     {
         ui.heading("3. Display");
 
+        // ── Background ─────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.label("Background");
+            ui.color_edit_button_rgb(&mut self.background_color);
+        });
+
         // ── Surface ────────────────────────────────────────
         ui.checkbox(&mut render_state.show_surface, "Show triangle surface");
         if render_state.show_surface {
@@ -2134,6 +2212,27 @@ impl App {
                 }
                 ui.add(egui::Slider::new(&mut render_state.opacity, 0.0..=1.0)
                     .text("Opacity"));
+
+                // ── PBR Material ──────────────────────────
+                ui.add_space(4.0);
+                ui.label("PBR Material:");
+                if ui.add(egui::Slider::new(&mut self.surface_metallic, 0.0..=1.0)
+                    .text("Metallic"))
+                    .on_hover_text("0 = dielectric (plastic/ceramic), 1 = metal")
+                    .changed()
+                {
+                    self.needs_remesh = true;
+                }
+                if ui.add(egui::Slider::new(&mut self.surface_roughness, 0.0..=1.0)
+                    .text("Roughness"))
+                    .on_hover_text("0 = mirror-smooth, 1 = fully rough/matte")
+                    .changed()
+                {
+                    self.needs_remesh = true;
+                }
+                ui.add(egui::Slider::new(&mut self.env_intensity, 0.0..=3.0)
+                    .text("Env intensity"))
+                    .on_hover_text("IBL environment light multiplier");
             });
         }
 
@@ -2203,14 +2302,14 @@ impl App {
                     ui.label("Vertices  V"); ui.label(format!("{}", t.vertices)); ui.end_row();
                     ui.label("Edges     E"); ui.label(format!("{}", t.edges)); ui.end_row();
                     ui.label("Faces     F"); ui.label(format!("{}", t.faces)); ui.end_row();
-                    ui.label("Euler     χ = V−E+F"); ui.label(format!("{}", t.euler)); ui.end_row();
+                    ui.label("Euler     chi = V-E+F"); ui.label(format!("{}", t.euler)); ui.end_row();
                     ui.label("Boundary edges"); ui.label(format!("{}", t.boundary_edges)); ui.end_row();
                     ui.label("Non-manifold edges"); ui.label(format!("{}", t.non_manifold_edges)); ui.end_row();
                     ui.label("Connected components"); ui.label(format!("{}", t.connected_components)); ui.end_row();
                     ui.label("Watertight"); ui.label(format!("{}", t.is_watertight)); ui.end_row();
                 });
                 ui.add_space(6.0);
-                ui.label("χ legend: 2=sphere, 0=torus, −2=double torus, …");
+                ui.label("chi legend: 2=sphere, 0=torus, -2=double torus, ...");
             }
         }
     }
@@ -2270,7 +2369,7 @@ fn main() {
         for phi in [0.3_f32, 0.5, 0.7] {
             let c_val = solve_c_for_vol_frac(&tree, phi);
             let field = tree.clone() - c_val;
-            let mesh = build_mesh(
+            let (mesh, _stats) = build_mesh(
                 field, "iso-test",
                 MeshBackend::MarchingCubes33, 6, 96,
                 false, 1.0, Morphology::MinimalSurface, [1.0, 1.0, 1.0],
@@ -2296,12 +2395,13 @@ fn main() {
         // Skeletal mesh topology test: MC33 TPMS surface + box CSG cap.
         eprintln!("\n[skeletal selftest] building skeletal mesh (gyroid, res=64)...");
         let t0 = std::time::Instant::now();
-        let sk_mesh = build_mesh(
+        let (sk_mesh, sk_stats) = build_mesh(
             tree.clone(), "skeletal-test",
             MeshBackend::MarchingCubes33, 5, 64,
             false, 1.0, Morphology::Skeletal, [1.0, 1.0, 1.0],
         );
         let sk_dt = t0.elapsed();
+        eprintln!("  {sk_stats}");
         let sk_topo = engvis_core::topology::compute_topology(&sk_mesh);
         eprintln!(
             "[skeletal selftest] V={} F={} | χ={} boundary_edges={} components={} watertight={} | {:.0}ms",
@@ -2315,13 +2415,14 @@ fn main() {
         eprintln!("\n[shell selftest] building shell mesh (gyroid, res=96)...");
         let shell_half_t = 0.5 * 0.1 * p.tpms_period.max(1.0);
         let t0 = std::time::Instant::now();
-        let sh_mesh = build_shell_mesh(
+        let (sh_mesh, sh_stats) = build_shell_mesh(
             tree.clone(), shell_half_t, "shell-test", 96,
             false, 1.0, [1.0, 1.0, 1.0],
         );
         let sh_dt = t0.elapsed();
+        eprintln!("  {sh_stats}");
         eprintln!(
-            "[shell selftest] V={} F={} | {:.0}ms (topology already printed above)",
+            "[shell selftest] V={} F={} | {:.0}ms",
             sh_mesh.vertices.len(), sh_mesh.indices.len() / 3,
             sh_dt.as_secs_f64() * 1e3,
         );
@@ -2350,11 +2451,15 @@ fn main() {
         show_ms_loops: false,
         show_bounding: true,
         show_surface_edges: false,
-        edge_color: [0.9, 0.9, 0.9],
+        edge_color: [0.35, 0.35, 0.35],
         edge_line_width: 2.0,
-        wireframe_color: [0.9, 0.9, 0.9],
+        wireframe_color: [0.3, 0.3, 0.3],
         wireframe_line_width: 2.0,
-        surface_color: [0.2, 0.6, 0.9],
+        surface_color: [0.30, 0.65, 0.90],
+        surface_metallic: 0.9,
+        surface_roughness: 0.18,
+        env_intensity: 1.0,
+        background_color: [1.0, 1.0, 1.0],
         current_step: Step::Source,
         pending_load: None,
         pending_save: None,
@@ -2362,7 +2467,9 @@ fn main() {
         camera_fitted: false,
         last_topology: None,
         last_build_ok: true,
+        formula_cache: formula_cache::FormulaCache::new(),
         mesh_build_result: None,
         build_status: "ready".into(),
+        build_stats: String::new(),
     });
 }

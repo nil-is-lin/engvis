@@ -12,6 +12,11 @@ pub struct SceneNode {
     pub mesh_index: Option<usize>,
     pub children: Vec<SceneNode>,
     pub visible: bool,
+    /// Whether to draw this node's mesh through the solid surface pipeline.
+    /// Set to `false` for wireframe-only nodes (bounding box, clip sphere)
+    /// whose degenerate triangles would produce aliased 1px lines that
+    /// interfere with the smooth edge-overlay rendering.
+    pub render_surface: bool,
     /// Whether to draw this node's edges in the edge-overlay pass.
     /// Used for wireframe bounding boxes / outlines that should not
     /// light up every triangle edge of the surface mesh.
@@ -62,6 +67,7 @@ impl Scene {
                 mesh_index: Some(0),
                 children: Vec::new(),
                 visible: true,
+                render_surface: true,
                 render_edges: false,
                 edge_color_override: None,
                 edge_width_override: None,

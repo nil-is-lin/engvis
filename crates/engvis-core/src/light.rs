@@ -11,9 +11,10 @@ pub struct DirectionalLight {
 impl Default for DirectionalLight {
     fn default() -> Self {
         Self {
-            direction: Vec3::new(-0.5, -1.0, -0.3).normalize(),
-            color: [1.0, 0.98, 0.95],
-            intensity: 4.0,
+            // Key light: from upper-right-front (Z-up convention)
+            direction: Vec3::new(-0.6, -0.8, -1.2).normalize(),
+            color: [1.0, 0.97, 0.92],
+            intensity: 7.0,
             cast_shadows: false,
         }
     }
@@ -36,8 +37,8 @@ pub struct AmbientLight {
 impl Default for AmbientLight {
     fn default() -> Self {
         Self {
-            color: [0.4, 0.42, 0.45],
-            intensity: 0.3,
+            color: [0.45, 0.47, 0.50],
+            intensity: 0.5,
         }
     }
 }
@@ -56,11 +57,18 @@ impl Default for LightingEnvironment {
             ambient: AmbientLight::default(),
             directional_lights: vec![
                 DirectionalLight::default(),
-                // Fill light from opposite side
+                // Fill light from lower-left (Z-up)
                 DirectionalLight {
-                    direction: Vec3::new(0.6, -0.3, 0.7).normalize(),
-                    color: [0.9, 0.92, 1.0],
-                    intensity: 1.5,
+                    direction: Vec3::new(0.4, -0.6, -0.3).normalize(),
+                    color: [0.85, 0.88, 0.95],
+                    intensity: 3.0,
+                    cast_shadows: false,
+                },
+                // Rim/back light for edge definition
+                DirectionalLight {
+                    direction: Vec3::new(0.1, 0.6, 0.4).normalize(),
+                    color: [1.0, 1.0, 1.0],
+                    intensity: 2.0,
                     cast_shadows: false,
                 },
             ],

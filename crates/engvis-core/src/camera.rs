@@ -25,7 +25,7 @@ impl OrbitCamera {
     pub fn new(target: Vec3, distance: f32) -> Self {
         Self {
             target,
-            orientation: Quat::from_rotation_y(-0.785) * Quat::from_rotation_x(-0.615),
+            orientation: Quat::from_rotation_z(-0.785) * Quat::from_rotation_x(-0.615),
             distance,
             fov_y: std::f32::consts::FRAC_PI_4, // 45 degrees
             near: 0.01,
@@ -137,27 +137,28 @@ impl OrbitCamera {
 
     /// Set orientation from yaw/pitch angles (compatibility helper).
     pub fn set_orientation_yaw_pitch(&mut self, yaw: f32, pitch: f32) {
-        self.orientation = Quat::from_rotation_y(yaw) * Quat::from_rotation_x(-pitch);
+        self.orientation = Quat::from_rotation_z(yaw) * Quat::from_rotation_x(-pitch);
     }
 
-    /// Preset: front view
+    /// Preset: front view (camera at -Y, looking at +Y, Z up)
     pub fn view_front(&mut self) {
+        self.orientation = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    }
+
+    /// Preset: top view (camera at +Z, looking at -Z, Y up on screen)
+    pub fn view_top(&mut self) {
         self.orientation = Quat::IDENTITY;
     }
 
-    /// Preset: top view
-    pub fn view_top(&mut self) {
-        self.orientation = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-    }
-
-    /// Preset: right view
+    /// Preset: right view (camera at +X, looking at -X, Z up)
     pub fn view_right(&mut self) {
-        self.orientation = Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+        self.orientation = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2)
+            * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
     }
 
-    /// Preset: isometric view
+    /// Preset: isometric view (Z-up, 3/4 angle)
     pub fn view_iso(&mut self) {
-        self.orientation = Quat::from_rotation_y(-0.785) * Quat::from_rotation_x(-0.615);
+        self.orientation = Quat::from_rotation_z(-0.785) * Quat::from_rotation_x(-0.615);
     }
 }
 

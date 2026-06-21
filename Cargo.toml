@@ -28,6 +28,7 @@ stl_io.workspace = true
 ply-rs-bw.workspace = true
 rfd.workspace = true
 earcutr = "0.4"
+resvg = "0.47"
 
 [workspace]
 resolver = "2"

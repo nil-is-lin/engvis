@@ -444,17 +444,57 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         Lo = Lo + (diffuse + specular) * radiance * NdotL;
     }
 
-    // Ambient
-    let ambient = lighting.ambient_color.rgb * lighting.ambient_color.a * base_color.rgb;
+    // ── Image-Based Lighting (procedural environment) ────────
+    // Split-sum approximation: separate diffuse irradiance and
+    // prefiltered specular with a BRDF integration factor.
+    // This makes roughness, metallic, and view-angle all visibly
+    // affect the surface, which is the core advantage of PBR.
+    let NoV = max(dot(N, V), 0.0);
+    let R = reflect(-V, N);
+
+    // Procedural sky gradient with a directional sun highlight
+    let env_top   = vec3<f32>(0.90, 0.93, 1.00);
+    let env_bot   = vec3<f32>(0.30, 0.28, 0.25);
+    let env_horiz = vec3<f32>(0.55, 0.53, 0.50);
+    let t_env   = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
+    let env_base = mix(env_bot, env_horiz, smoothstep(0.0, 0.35, t_env));
+    var env_color = mix(env_base, env_top, smoothstep(0.35, 1.0, t_env));
+    // Directional sun highlight for sharp specular at low roughness
+    let sun_dir = normalize(vec3<f32>(0.6, 0.8, 1.2));
+    let sun_dot = max(dot(R, sun_dir), 0.0);
+    env_color = env_color + vec3<f32>(1.0, 0.95, 0.85) * pow(sun_dot, 64.0) * 2.5;
+    env_color = env_color * scene.global_opacity.y; // env_intensity
+
+    // ── Diffuse irradiance (cosine-weighted hemisphere) ───
+    let Nd = normalize(N + vec3<f32>(0.0, 0.25, 0.0));
+    let t_d   = clamp(Nd.y * 0.5 + 0.5, 0.0, 1.0);
+    var irradiance = mix(env_bot * 0.6, env_horiz * 0.8, smoothstep(0.0, 0.4, t_d));
+    irradiance = mix(irradiance, env_top * 1.2, smoothstep(0.4, 1.0, t_d));
+    irradiance = irradiance * (0.55 + 0.45 * N.y) * PI * scene.global_opacity.y;
+
+    // ── Specular prefiltered environment (roughness-dependent) ──
+    // Roughness^4 mimics the GGX prefiltered env-map mip chain.
+    let spec_power = max(1.0 - roughness * roughness * roughness * roughness, 0.01);
+    let spec_env = env_color * spec_power;
+
+    // ── BRDF integration (F0 + F1 Schlick approximation) ───
+    let f0_ibl = pow(clamp(1.0 - NoV, 0.0, 1.0), 5.0);
+    let brdf_fac = vec3<f32>(1.0 - f0_ibl) * (1.0 - roughness * 0.5) + f0_ibl;
+
+    // ── Combine IBL contributions ───────────────────────────
+    let kS_ibl = fresnel_schlick(NoV, F0);
+    let kD_ibl = (vec3<f32>(1.0) - kS_ibl) * (1.0 - metallic);
+    let ibl_diffuse = kD_ibl * irradiance * base_color.rgb / PI;
+    let ibl_specular = kS_ibl * spec_env * brdf_fac;
+    let ambient = (ibl_diffuse + ibl_specular) * lighting.ambient_color.a;
     let emissive = material.emissive.rgb;
 
     var color = ambient + Lo + emissive;
 
-    // Simple tonemap (Reinhard) - HDR to [0,1)
-    color = color / (color + vec3<f32>(1.0));
-    // Gamma correction is handled by GPU automatically: we write linear color to
-    // a Bgra8UnormSrgb surface, and the GPU converts linear -> sRGB.
-    // Do NOT apply pow(color, 1/2.2) here - that would cause double gamma!
+    // ACES filmic tonemap — preserves highlights and colour saturation
+    // much better than simple Reinhard.
+    color = color * (color * 2.51 + 0.03) / (color * (color * 2.43 + 0.59) + 0.14);
+    color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
 
     return vec4<f32>(color, base_color.a * scene.global_opacity.x);
 }

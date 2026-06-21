@@ -46,7 +46,7 @@ impl Default for VertexRenderOptions {
     fn default() -> Self {
         Self {
             enabled: false,
-            color: [1.0, 0.85, 0.3],
+            color: [0.85, 0.65, 0.1],
             point_size: 4.0,
         }
     }
@@ -64,7 +64,7 @@ impl Default for EdgeRenderOptions {
     fn default() -> Self {
         Self {
             enabled: false,
-            color: [0.2, 0.8, 1.0],
+            color: [0.1, 0.55, 0.7],
             line_width: 5.0,
         }
     }
@@ -87,6 +87,10 @@ pub struct RenderState {
     pub show_grid: bool,
     /// Global surface opacity (0.0 = fully transparent, 1.0 = fully opaque).
     pub opacity: f32,
+    /// Environment / IBL intensity multiplier (0.0 = no env light, 1.0 = default).
+    pub env_intensity: f32,
+    /// Background clear color (RGB, each channel 0..1).
+    pub background_color: [f32; 3],
     /// Vertex (point) overlay options.
     pub vertex_opts: VertexRenderOptions,
     /// Edge (wireframe) overlay options.
@@ -99,6 +103,8 @@ impl Default for RenderState {
             show_surface: true,
             show_grid: true,
             opacity: 1.0,
+            env_intensity: 1.0,
+            background_color: [1.0, 1.0, 1.0],
             vertex_opts: VertexRenderOptions::default(),
             edge_opts: EdgeRenderOptions::default(),
         }

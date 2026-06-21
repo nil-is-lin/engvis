@@ -59,6 +59,10 @@ impl EngvisApp for App {
             mesh_index: Some(meshes.len() - 1),
             children: Vec::new(),
             visible: true,
+            render_surface: true,
+            render_edges: false,
+            edge_color_override: None,
+            edge_width_override: None,
         });
 
         // 2. Coordinate axes
@@ -79,6 +83,10 @@ impl EngvisApp for App {
                 mesh_index: Some(meshes.len() - 1),
                 children: Vec::new(),
                 visible: true,
+                render_surface: true,
+                render_edges: false,
+                edge_color_override: None,
+                edge_width_override: None,
             });
         }
 
@@ -95,6 +103,10 @@ impl EngvisApp for App {
                 mesh_index: Some(meshes.len() - 1),
                 children: Vec::new(),
                 visible: true,
+                render_surface: true,
+                render_edges: false,
+                edge_color_override: None,
+                edge_width_override: None,
             });
         }
 
@@ -122,6 +134,10 @@ impl EngvisApp for App {
             mesh_index: Some(jet_mesh_idx),
             children: Vec::new(),
             visible: true,
+            render_surface: true,
+            render_edges: false,
+            edge_color_override: None,
+            edge_width_override: None,
         });
 
         // 5. Colorbar — Viridis colormap (hidden by default, shifted right)
@@ -148,6 +164,10 @@ impl EngvisApp for App {
             mesh_index: Some(vir_mesh_idx),
             children: Vec::new(),
             visible: false,
+            render_surface: true,
+            render_edges: false,
+            edge_color_override: None,
+            edge_width_override: None,
         });
 
         Scene {

@@ -17,6 +17,10 @@ use crate::postprocess::PostProcessPipeline;
 
 
 /// Scene uniform data (group 0)
+///
+/// `global_opacity`: `[opacity, env_intensity, _, _]`
+///   - x: global surface opacity (0..1)
+///   - y: environment / IBL intensity multiplier
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SceneUniforms {
@@ -102,7 +106,7 @@ impl Renderer {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             camera_pos: [0.0; 4],
             viewport: [width as f32, height as f32, 0.0, 0.0],
-            global_opacity: [1.0, 0.0, 0.0, 0.0],
+            global_opacity: [1.0, 1.0, 0.0, 0.0],
         };
 
         let scene_uniform_buffer =
@@ -303,7 +307,7 @@ impl Renderer {
            view_proj: camera.view_projection().to_cols_array_2d(),
            camera_pos: [camera.position().x, camera.position().y, camera.position().z, 1.0],
            viewport: [width as f32, height as f32, 0.0, 0.0],
-           global_opacity: [self.state.opacity, 0.0, 0.0, 0.0],
+           global_opacity: [self.state.opacity, self.state.env_intensity, 0.0, 0.0],
        };
         queue.write_buffer(
             &self.scene_uniform_buffer,
@@ -313,6 +317,9 @@ impl Renderer {
 
         // Update lighting
         self.lighting.update(queue, &scene.lighting);
+
+        // Keep grid visibility adaptive to background brightness.
+        self.grid_renderer.update_background_color(queue, self.state.background_color);
 
         // Update depth texture sizes if camera planes changed
         let s = &self.state;
@@ -328,9 +335,9 @@ impl Renderer {
                 resolve_target,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.15,
-                        g: 0.17,
-                        b: 0.19,
+                        r: self.state.background_color[0] as f64,
+                        g: self.state.background_color[1] as f64,
+                        b: self.state.background_color[2] as f64,
                         a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
@@ -432,7 +439,8 @@ impl Renderer {
 
         let world_transform = parent_transform * node.local_transform;
 
-        if let Some(mesh_idx) = node.mesh_index
+        if node.render_surface
+            && let Some(mesh_idx) = node.mesh_index
             && mesh_idx < self.mesh_renderer.mesh_buffers.len()
             && let mesh_buf = &self.mesh_renderer.mesh_buffers[mesh_idx]
             && mesh_buf.vertex_count > 0 && mesh_buf.index_count > 0
