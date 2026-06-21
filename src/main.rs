@@ -31,17 +31,24 @@ struct TreeParams<'a> {
     sphere_radius: f32,
     torus_major_r: f32,
     torus_minor_r: f32,
+    /// TPMS 内在周期 k（单位晶胞内的空间频率）。
+    /// 例如默认 gyroid 为 4，即一个单位立方体内有 4 个周期。
     tpms_period: f32,
+    /// 各方向的晶胞堆叠数 [nx, ny, nz]。
+    /// 同一个立方单元晶胞在 x/y/z 方向分别堆叠 nx/ny/nz 次，
+    /// 共 nx×ny×nz 个晶胞。build_tree 使用 k·nx·x, k·ny·y, k·nz·z。
+    tpms_cells: [f32; 3],
 }
 
 impl<'a> TreeParams<'a> {
-    /// Set a sensible default period when switching to a TPMS surface.
+    /// Set sensible defaults when switching to a TPMS surface.
     fn set_tpms_defaults(&mut self, name: &str) {
         self.tpms_period = match name {
             "gyroid" => 4.0,
             "fischer-koch-s" | "fischer-koch-y" => 2.0,
             _ => 3.0,
         };
+        self.tpms_cells = [1.0, 1.0, 1.0];
     }
 }
 
@@ -61,6 +68,10 @@ enum Morphology {
 }
 
 /// Built-in implicit surfaces. Each name maps to a Fidget `Tree`.
+///
+/// The TPMS formula uses $f(k·x, k·y, k·z)$ where $k$ is the intrinsic
+/// period.  Multiple unit cells are realised by expanding the *sampling
+/// domain* (see [`build_mc33_mesh_domain`]), not by scaling the formula.
 fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
     use fidget_core::context::Tree as T;
     let k = p.tpms_period;
@@ -73,19 +84,16 @@ fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
             (major.sqrt() - p.torus_major_r).square() + T::z().square()
           - p.torus_minor_r * p.torus_minor_r
         }
-        // Gyroid:        sin(kx)cos(ky) + sin(ky)cos(kz) + sin(kz)cos(kx) = 0
         "gyroid" => {
             let (x, y, z) = s(k);
             x.clone().sin() * y.clone().cos()
           + y.clone().sin() * z.clone().cos()
           + z.clone().sin() * x.clone().cos()
         }
-        // Schwarz P:     cos(kx) + cos(ky) + cos(kz) = 0
         "schwarz-p" => {
             let (x, y, z) = s(k);
             x.cos() + y.cos() + z.cos()
         }
-        // Schwarz D (Diamond):
         "schwarz-d" => {
             let (x, y, z) = s(k);
             let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
@@ -95,7 +103,6 @@ fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
           + cx.clone()*sy.clone()*cz.clone()
           + cx*cy*sz
         }
-        // Schoen IWP:
         "schoen-iwp" => {
             let (x, y, z) = s(k);
             let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
@@ -103,14 +110,12 @@ fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
             (cx.clone()*cy.clone() + cy*cz.clone() + cz*cx) * 2.0
           - (c2x + c2y + c2z)
         }
-        // Neovius:
         "neovius" => {
             let (x, y, z) = s(k);
             let (cx, cy, cz) = (x.cos(), y.cos(), z.cos());
             (cx.clone() + cy.clone() + cz.clone()) * 3.0
           + cx*cy*cz * 4.0
         }
-        // Fischer-Koch F-RD (Schoen FRD):
         "f-rd" => {
             let (x, y, z) = s(k);
             let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
@@ -118,7 +123,6 @@ fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
             cx*cy*cz * 4.0
           - (c2x.clone()*c2y.clone() + c2y*c2z.clone() + c2z*c2x)
         }
-        // Lidinoid — the only TPMS with an offset constant:
         "lidinoid" => {
             let (x, y, z) = s(k);
             let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
@@ -130,7 +134,6 @@ fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
           - (c2x.clone()*c2y.clone() + c2y*c2z.clone() + c2z*c2x) * 0.5
           + 0.15
         }
-        // Split-P — a TPMS with P-surface symmetry:
         "split-p" => {
             let (x, y, z) = s(k);
             let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
@@ -143,7 +146,6 @@ fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
           - (c2x.clone()*c2y.clone() + c2y.clone()*c2z.clone() + c2z.clone()*c2x.clone()) * 0.2
           - (c2x + c2y + c2z) * 0.4
         }
-        // Fischer-Koch S:
         "fischer-koch-s" => {
             let (x, y, z) = s(k);
             let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
@@ -153,7 +155,6 @@ fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
           + c2y*sz.clone()*cx.clone()
           + c2z*sx*cy
         }
-        // Fischer-Koch Y:
         "fischer-koch-y" => {
             let (x, y, z) = s(k);
             let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
@@ -162,15 +163,12 @@ fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
             cx*cy*cz * 2.0
           + s2x*sy.clone() + s2y*sz.clone() + s2z*sx
         }
-        // Fischer-Koch CP:
         "fischer-koch-cp" => {
             let (x, y, z) = s(k);
             let (cx, cy, cz) = (x.cos(), y.cos(), z.cos());
             cx.clone() + cy.clone() + cz.clone() + cx*cy*cz * 4.0
         }
         _ => {
-            // Fallback: gyroid at k=4.
-            let s = move |f| -> (T, T, T) { (T::x() * f, T::y() * f, T::z() * f) };
             let (x, y, z) = s(4.0);
             x.clone().sin() * y.clone().cos()
           + y.clone().sin() * z.clone().cos()
@@ -314,21 +312,21 @@ fn build_dc_mesh(tree: fidget_core::context::Tree, name: &str, depth: u8) -> Mes
 // =====================================================================
 
 fn build_mc33_mesh(tree: fidget_core::context::Tree, name: &str, res: usize) -> Mesh {
-    build_mc33_mesh_domain(tree, name, res, 1.0)
+    build_mc33_mesh_domain(tree, name, res, [1.0, 1.0, 1.0])
 }
 
-/// Like [`build_mc33_mesh`] but samples the cube `[-half, half]³`.
+/// Like [`build_mc33_mesh`] but samples the axis-aligned box
+/// `[-sx,sx] × [-sy,sy] × [-sz,sz]` where `extent = [sx, sy, sz]`.
 ///
-/// A `half > 1` pads the domain so that a field which has been
-/// CSG-intersected with the unit box (positive outside `[-1,1]³`)
-/// produces a *sign change at the box faces*.  Marching Cubes then
-/// generates the cap triangles itself, yielding a watertight mesh
-/// without any fragile boundary-loop reconstruction.
+/// For `extent = [1,1,1]` this is the classic unit cube.  Larger
+/// extents expand the domain (e.g. for multi-unit-cell TPMS) while
+/// keeping grid-cell size approximately constant by scaling the
+/// resolution with `max(sx, sy, sz)`.
 fn build_mc33_mesh_domain(
     tree: fidget_core::context::Tree,
     name: &str,
     res: usize,
-    half: f32,
+    extent: [f32; 3],
 ) -> Mesh {
     use fidget_core::shape::Shape;
     use fidget_jit::JitFunction;
@@ -336,8 +334,10 @@ fn build_mc33_mesh_domain(
     let t_shape = std::time::Instant::now();
     let shape = Shape::<JitFunction>::from(tree);
 
-    // Scale resolution with the padded domain so cell size stays ~constant.
-    let res = ((res as f32) * half).ceil() as usize;
+    // Scale base resolution with the largest extent so cell size
+    // stays ~constant regardless of the number of stacked unit cells.
+    let max_extent = extent.iter().cloned().fold(1.0_f32, f32::max);
+    let base_res = ((res as f32) * max_extent).ceil() as usize;
 
     let float_tape = shape.float_slice_tape(Default::default());
     let dt_shape = t_shape.elapsed();
@@ -349,16 +349,18 @@ fn build_mc33_mesh_domain(
     // grid and evaluate them in a single float_slice_eval call.
     // For res=256 this replaces ~17M individual evaluator creations
     // with a single batch evaluation.
-    let (x0, x1) = (-half, half);
-    let (y0, y1) = (-half, half);
-    let (z0, z1) = (-half, half);
-    let nx = res; let ny = res; let nz = res;
+    let (x0, x1, y0, y1, z0, z1) = (-extent[0], extent[0], -extent[1], extent[1], -extent[2], extent[2]);
+    // Grid counts proportional to per-axis extent, keeping cell size ~uniform.
+    let inv_max = 1.0 / max_extent;
+    let nx = ((base_res as f32) * extent[0] * inv_max).ceil() as usize;
+    let ny = ((base_res as f32) * extent[1] * inv_max).ceil() as usize;
+    let nz = ((base_res as f32) * extent[2] * inv_max).ceil() as usize;
     let dx = (x1 - x0) / nx as f32;
     let dy = (y1 - y0) / ny as f32;
     let dz = (z1 - z0) / nz as f32;
-    let sx = ny + 1;
-    let sy = nz + 1;
-    let total = (nx + 1) * sx * sy;
+    let stride_y = ny + 1;
+    let stride_z = nz + 1;
+    let total = (nx + 1) * stride_y * stride_z;
 
     let t_grid = std::time::Instant::now();
     let mut xs = Vec::with_capacity(total);
@@ -409,11 +411,14 @@ fn build_mc33_mesh_domain(
         (z0, z1, nz),
     );
     let dt_extract = t_extract.elapsed();
-    // Only the non-padded path (half == 1) clamps stray vertices back to
-    // the sampling box.  For padded box-CSG solids the surface closes a
-    // little outside [-1,1]; clamping there would collapse distinct
-    // vertices and create non-manifold edges, so we leave them as-is.
-    if (half - 1.0).abs() < 1e-6 {
+    // For the classic unit-cube (non-padded) path, clamp stray vertices
+    // back to [-1,1]³.  For padded box-CSG solids the surface may
+    // legitimately extend slightly beyond the box—clamping would create
+    // non-manifold edges, so skip it.
+    let is_unit = (extent[0] - 1.0).abs() < 1e-6
+               && (extent[1] - 1.0).abs() < 1e-6
+               && (extent[2] - 1.0).abs() < 1e-6;
+    if is_unit {
         let mut out_of_bounds = 0usize;
         for p in &mut pos {
             for v in &mut *p {
@@ -479,29 +484,68 @@ fn recompute_smooth_normals(mesh: &mut Mesh) {
     }
 }
 
-/// Build a wireframe mesh of the cube [-1,1]³ (12 edges).
-/// Each edge is a degenerate triangle (A,B,A) so that PBR rasterisation
-/// produces no fragments (zero area) but `extract_edge_indices` yields
-/// the line segment (A,B) for the edge-overlay pass.
-fn build_box_wireframe() -> Mesh {
-    let c = 1.0_f32;
+/// Build a wireframe with outer box + internal cell-boundary grid lines.
+///
+/// For `extent = [nx, ny, nz]` (unit cells per axis), the outer box is
+/// `[-nx,nx]×[-ny,ny]×[-nz,nz]` and internal divider lines are drawn at
+/// each cell boundary, making the unit-cell structure visually obvious.
+fn build_box_wireframe(extent: [f32; 3]) -> Mesh {
+    let [sx, sy, sz] = extent;
     let pts: [[f32;3]; 8] = [
-        [-c,-c,-c], [ c,-c,-c], [ c, c,-c], [-c, c,-c],
-        [-c,-c, c], [ c,-c, c], [ c, c, c], [-c, c, c],
+        [-sx,-sy,-sz], [ sx,-sy,-sz], [ sx, sy,-sz], [-sx, sy,-sz],
+        [-sx,-sy, sz], [ sx,-sy, sz], [ sx, sy, sz], [-sx, sy, sz],
     ];
-    let edges = [
+    let outer_edges = [
         (0,1),(1,2),(2,3),(3,0), // bottom
         (4,5),(5,6),(6,7),(7,4), // top
         (0,4),(1,5),(2,6),(3,7), // verticals
     ];
+
     let mut positions = Vec::new();
     let mut indices = Vec::new();
-    for &(a,b) in &edges {
+    let mut push_edge = |p0: [f32;3], p1: [f32;3]| {
         let base = positions.len() as u32;
-        positions.push(pts[a]);
-        positions.push(pts[b]);
+        positions.push(p0);
+        positions.push(p1);
         // degenerate triangle (A, B, A): zero area, yields edge (A,B)
         indices.extend_from_slice(&[base, base+1, base]);
+    };
+
+    // Outer box
+    for &(a,b) in &outer_edges {
+        push_edge(pts[a], pts[b]);
+    }
+
+    // Internal cell-boundary dividers
+    let nx = extent[0] as usize;
+    let ny = extent[1] as usize;
+    let nz = extent[2] as usize;
+
+    // x-dividers (rectangles in yz plane at each internal x boundary)
+    for i in 1..nx {
+        let x = -sx + 2.0 * sx * i as f32 / nx as f32;
+        push_edge([x, -sy, -sz], [x,  sy, -sz]);
+        push_edge([x,  sy, -sz], [x,  sy,  sz]);
+        push_edge([x,  sy,  sz], [x, -sy,  sz]);
+        push_edge([x, -sy,  sz], [x, -sy, -sz]);
+    }
+
+    // y-dividers (rectangles in xz plane)
+    for j in 1..ny {
+        let y = -sy + 2.0 * sy * j as f32 / ny as f32;
+        push_edge([-sx, y, -sz], [ sx, y, -sz]);
+        push_edge([ sx, y, -sz], [ sx, y,  sz]);
+        push_edge([ sx, y,  sz], [-sx, y,  sz]);
+        push_edge([-sx, y,  sz], [-sx, y, -sz]);
+    }
+
+    // z-dividers (rectangles in xy plane)
+    for k in 1..nz {
+        let z = -sz + 2.0 * sz * k as f32 / nz as f32;
+        push_edge([-sx, -sy, z], [ sx, -sy, z]);
+        push_edge([ sx, -sy, z], [ sx,  sy, z]);
+        push_edge([ sx,  sy, z], [-sx,  sy, z]);
+        push_edge([-sx,  sy, z], [-sx, -sy, z]);
     }
     wireframe_mesh_from_segments("box-wireframe", positions, indices)
 }
@@ -730,20 +774,25 @@ fn build_shell_mesh(
     res: usize,
     clip_to_unit_ball: bool,
     clip_radius: f32,
+    domain_extent: [f32; 3],
 ) -> Mesh {
     use fidget_core::context::Tree as T;
 
-    // Box-CSG: intersect with unit-box solid so MC generates cap faces.
-    let half = 1.0 + 4.0 / res as f32;
+    let [sx, sy, sz] = domain_extent;
+    // Padding for MC to detect sign changes at box faces.
+    let pad = 4.0 / res as f32;
+    let mc_extent = [sx + pad, sy + pad, sz + pad];
+    let max_extent = sx.max(sy).max(sz).max(1.0);
+    let half = max_extent + pad;
     let cell = 2.0 * half / (res as f32 * half).ceil();
-    let c = 1.0 - 0.5 * cell;
-    let box_sdf = T::x().abs().max(T::y().abs()).max(T::z().abs()) - c;
+    let (cx, cy, cz) = (sx - 0.5 * cell, sy - 0.5 * cell, sz - 0.5 * cell);
+    let box_sdf = (T::x().abs() - cx).max(T::y().abs() - cy).max(T::z().abs() - cz);
 
     // Thin-wall solid: g = f² − half_t² (smooth, no cusp), then
     // CSG-intersect with the box.
     let wall = tree.square() - half_t * half_t;
     let field = wall.max(box_sdf);
-    let mut mesh = build_mc33_mesh_domain(field, name, res, half);
+    let mut mesh = build_mc33_mesh_domain(field, name, res, mc_extent);
 
     if clip_to_unit_ball {
         clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], clip_radius);
@@ -771,30 +820,33 @@ fn build_mesh(
     clip_to_unit_ball: bool,
     clip_radius: f32,
     morphology: Morphology,
+    domain_extent: [f32; 3],
 ) -> Mesh {
-    // Skeletal mode must produce a *closed solid*.  Rather than
-    // reconstruct boundary loops after meshing (fragile, leaves holes),
-    // we CSG-intersect the field with the unit-box solid and mesh over a
-    // slightly padded domain.  Marching Cubes then generates the cap
-    // faces on x/y/z = ±1 itself, giving a watertight mesh.
-    // Shell mode is handled separately by build_shell_mesh (dual-iso).
+    let [sx, sy, sz] = domain_extent;
+    let max_extent = sx.max(sy).max(sz).max(1.0);
+    let pad = 4.0 / mc_res as f32;
+
     let is_solid = matches!(morphology, Morphology::Skeletal);
     let mesh = if is_solid {
         use fidget_core::context::Tree as T;
-        let half = 1.0 + 4.0 / mc_res as f32;
+        let half = max_extent + pad;
         let cell = 2.0 * half / (mc_res as f32 * half).ceil();
-        let c = 1.0 - 0.5 * cell;
-        let box_sdf = T::x().abs().max(T::y().abs()).max(T::z().abs()) - c;
+        let (cx, cy, cz) = (sx - 0.5 * cell, sy - 0.5 * cell, sz - 0.5 * cell);
+        let box_sdf = (T::x().abs() - cx).max(T::y().abs() - cy).max(T::z().abs() - cz);
         let clipped = tree.clone().max(box_sdf);
+        let mc_extent = [sx + pad, sy + pad, sz + pad];
         match backend {
             MeshBackend::DualContouring => build_dc_mesh(clipped, name, depth),
             MeshBackend::MarchingCubes33 =>
-                build_mc33_mesh_domain(clipped, name, mc_res, half),
+                build_mc33_mesh_domain(clipped, name, mc_res, mc_extent),
         }
     } else {
+        // Minimal surface: expand domain when multiple cells.
+        let mc_extent = [sx + pad, sy + pad, sz + pad];
         match backend {
             MeshBackend::DualContouring => build_dc_mesh(tree.clone(), name, depth),
-            MeshBackend::MarchingCubes33 => build_mc33_mesh(tree.clone(), name, mc_res),
+            MeshBackend::MarchingCubes33 =>
+                build_mc33_mesh_domain(tree.clone(), name, mc_res, mc_extent),
         }
     };
     let mut mesh = mesh;
@@ -1146,7 +1198,6 @@ const TPMS_SURFACES: &[(&str, &str)] = &[
 fn solve_c_for_vol_frac(
     tree: &fidget_core::context::Tree,
     target_phi: f32,
-    _period: f32,
 ) -> f32 {
     use fidget_core::shape::Shape;
     use fidget_jit::JitFunction;
@@ -1204,7 +1255,10 @@ struct App {
     sphere_radius: f32,
     torus_major_r: f32,
     torus_minor_r: f32,
+    /// TPMS 内在周期 k（单个晶胞内的空间频率）。
     tpms_period: f32,
+    /// 各方向晶胞堆叠数 [nx, ny, nz]；总晶胞数 = nx×ny×nz。
+    tpms_cells: [f32; 3],
     tpms_thickness: f32,
     /// 体积分数 φ ∈ [0,1]：0.5=对称极小曲面，→0/1=完全填充。
     tpms_vol_frac: f32,
@@ -1264,6 +1318,7 @@ struct AppBuildSnapshot {
     torus_major_r: f32,
     torus_minor_r: f32,
     tpms_period: f32,
+    tpms_cells: [f32; 3],
     tpms_thickness: f32,
     /// 体积分数 φ ∈ [0,1]：0.5=对称极小曲面，→0/1=完全填充。
     /// 内部通过二分查找求解对应的 C 值（f = C 的等值面）。
@@ -1291,6 +1346,7 @@ impl AppBuildSnapshot {
             torus_major_r: app.torus_major_r,
             torus_minor_r: app.torus_minor_r,
             tpms_period: app.tpms_period,
+            tpms_cells: app.tpms_cells,
             tpms_thickness: app.tpms_thickness,
             tpms_vol_frac: app.tpms_vol_frac,
             morphology: app.morphology,
@@ -1325,6 +1381,7 @@ impl AppBuildSnapshot {
                     torus_major_r: self.torus_major_r,
                     torus_minor_r: self.torus_minor_r,
                     tpms_period: self.tpms_period,
+                    tpms_cells: self.tpms_cells,
                 };
                 Ok(build_tree(&p))
             }
@@ -1355,6 +1412,7 @@ impl AppBuildSnapshot {
         let shell_grad = if matches!(&self.source,
             SurfaceSource::BuiltIn(n) if TPMS_SURFACES.iter().any(|(k,_)| k == n))
         {
+            // |grad f| ≈ k（单元晶胞内的最大梯度）。
             self.tpms_period.max(1.0)
         } else {
             1.0
@@ -1371,7 +1429,7 @@ impl AppBuildSnapshot {
         // 仅 Skeletal 模式使用；MinimalSurface 固定 f=0，与 C 无关。
         let c_value = if matches!(self.morphology, Morphology::Skeletal)
         {
-            solve_c_for_vol_frac(&tree, self.tpms_vol_frac, self.tpms_period)
+            solve_c_for_vol_frac(&tree, self.tpms_vol_frac)
         } else {
             0.0
         };
@@ -1388,7 +1446,10 @@ impl AppBuildSnapshot {
             let mut min_feature = match &self.source {
                 SurfaceSource::BuiltIn("torus") => 2.0 * self.torus_minor_r,
                 SurfaceSource::BuiltIn(n)
-                    if TPMS_SURFACES.iter().any(|(k,_)| k == n) => std::f32::consts::PI / self.tpms_period,
+                    if TPMS_SURFACES.iter().any(|(k,_)| k == n) => {
+                    // 最小特征尺寸由最高频方向决定（周期 k）。
+                    std::f32::consts::PI / self.tpms_period
+                }
                 _ => 0.5,
             };
             if matches!(self.morphology, Morphology::Shell) {
@@ -1406,17 +1467,25 @@ impl AppBuildSnapshot {
             }
             needed
         };
+        // Domain extent: for TPMS, per-axis cell counts; otherwise unit cube.
+        let domain_extent = if matches!(&self.source,
+            SurfaceSource::BuiltIn(n) if TPMS_SURFACES.iter().any(|(k,_)| k == n))
+        {
+            self.tpms_cells
+        } else {
+            [1.0, 1.0, 1.0]
+        };
         let mesh = if matches!(self.morphology, Morphology::Shell) {
             build_shell_mesh(
                 tree.clone(), shell_half_t, &label, effective_res,
-                self.clip_to_unit_ball, self.clip_radius,
+                self.clip_to_unit_ball, self.clip_radius, domain_extent,
             )
         } else {
             build_mesh(
                 tree.clone(), &label,
                 self.mesh_backend, self.surf_depth, effective_res,
                 self.clip_to_unit_ball, self.clip_radius,
-                self.morphology,
+                self.morphology, domain_extent,
             )
         };
         let topology = Some(compute_topology(&mesh));
@@ -1462,7 +1531,14 @@ impl AppBuildSnapshot {
             let wf_mesh = if self.clip_to_unit_ball {
                 build_sphere_wireframe(self.clip_radius, 12, 24)
             } else {
-                build_box_wireframe()
+                let extent = if matches!(&self.source,
+                    SurfaceSource::BuiltIn(n) if TPMS_SURFACES.iter().any(|(k,_)| k == n))
+                {
+                    self.tpms_cells
+                } else {
+                    [1.0, 1.0, 1.0]
+                };
+                build_box_wireframe(extent)
             };
             let wf_mat = PbrMaterial { name: "wireframe".into(), ..Default::default() };
             let wi = scene.meshes.len();
@@ -1519,6 +1595,7 @@ impl App {
             torus_major_r: self.torus_major_r,
             torus_minor_r: self.torus_minor_r,
             tpms_period: self.tpms_period,
+            tpms_cells: self.tpms_cells,
         }
     }
 
@@ -1575,11 +1652,8 @@ impl EngvisApp for App {
         self.build_scene_sync()
     }
 
-    fn on_ready(&mut self, _scene: &Scene, camera: &mut OrbitCamera) {
-        camera.fit_to_aabb(Aabb {
-            min: glam::Vec3::new(-1.0, -1.0, -1.0),
-            max: glam::Vec3::new(1.0, 1.0, 1.0),
-        });
+    fn on_ready(&mut self, scene: &Scene, camera: &mut OrbitCamera) {
+        camera.fit_to_scene(scene);
         self.camera_fitted = true;
     }
 
@@ -1607,6 +1681,13 @@ impl EngvisApp for App {
                     self.build_status = "ready".into();
                 }
                 *frame.scene = result.scene;
+                // Adapt clip planes for the new scene size without
+                // resetting camera position / orientation.
+                let aabb = frame.scene.compute_aabb();
+                if aabb.is_valid() {
+                    frame.camera.near = 0.001;
+                    frame.camera.far = (aabb.diagonal() * 5.0).max(100.0);
+                }
                 *frame.scene_dirty = true;
             }
         }
@@ -1690,10 +1771,7 @@ impl EngvisApp for App {
         frame.render_state.edge_opts.color = self.edge_color;
         frame.render_state.edge_opts.line_width = self.edge_line_width;
         if !self.camera_fitted {
-            frame.camera.fit_to_aabb(Aabb {
-                min: glam::Vec3::new(-1.0, -1.0, -1.0),
-                max: glam::Vec3::new(1.0, 1.0, 1.0),
-            });
+            frame.camera.fit_to_scene(frame.scene);
             self.camera_fitted = true;
         }
 
@@ -1891,9 +1969,13 @@ impl App {
             self.selected_tpms = TPMS_SURFACES[tpms_idx].0;
             self.source = SurfaceSource::BuiltIn(self.selected_tpms);
             // Reset period to the surface's default
-            let mut p = self.tree_params();
-            p.set_tpms_defaults(self.selected_tpms);
-            self.tpms_period = p.tpms_period;
+            let (def_k, def_cells) = {
+                let mut p = self.tree_params();
+                p.set_tpms_defaults(self.selected_tpms);
+                (p.tpms_period, p.tpms_cells)
+            };
+            self.tpms_period = def_k;
+            self.tpms_cells = def_cells;
             self.needs_remesh = true;
         }
         // Show formula + period slider when a TPMS is the active source
@@ -1904,10 +1986,27 @@ impl App {
                 ui.label("Implicit equation:");
                 let formula = tpms_formula(self.selected_tpms);
                 ui.code(formula);
-                if ui.add(egui::Slider::new(&mut self.tpms_period, 0.5..=10.0)
+                if ui.add(egui::Slider::new(&mut self.tpms_period, 1.0..=10.0)
                     .text("Period k")).changed() {
                     self.needs_remesh = true;
                 }
+                if ui.add(egui::Slider::new(&mut self.tpms_cells[0], 1.0..=10.0)
+                    .text("Unit cells nx").step_by(1.0)).changed() {
+                    self.needs_remesh = true;
+                }
+                if ui.add(egui::Slider::new(&mut self.tpms_cells[1], 1.0..=10.0)
+                    .text("Unit cells ny").step_by(1.0)).changed() {
+                    self.needs_remesh = true;
+                }
+                if ui.add(egui::Slider::new(&mut self.tpms_cells[2], 1.0..=10.0)
+                    .text("Unit cells nz").step_by(1.0)).changed() {
+                    self.needs_remesh = true;
+                }
+                let total = self.tpms_cells[0] * self.tpms_cells[1]
+                    * self.tpms_cells[2];
+                ui.label(format!("Total cells: {:.0} × {:.0} × {:.0} = {:.0}",
+                    self.tpms_cells[0], self.tpms_cells[1],
+                    self.tpms_cells[2], total));
                 ui.add_space(6.0);
                 ui.separator();
                 ui.label("Morphology:");
@@ -2129,7 +2228,8 @@ fn main() {
         for &(name, _) in TPMS_SURFACES {
             let p2 = TreeParams {
                 name, sphere_radius: 0.8,
-                torus_major_r: 0.6, torus_minor_r: 0.2, tpms_period: 4.0,
+                torus_major_r: 0.6, torus_minor_r: 0.2,
+                tpms_period: 4.0, tpms_cells: [1.0, 1.0, 1.0],
             };
             let tree2 = build_tree(&p2);
             use fidget_core::shape::Shape;
@@ -2164,15 +2264,16 @@ fn main() {
         // Validate the volume-fraction → C solver: varying φ must shift
         // the zero-set, producing a different mesh.
         let p = TreeParams { name: "gyroid", sphere_radius: 0.8,
-            torus_major_r: 0.6, torus_minor_r: 0.2, tpms_period: 4.0 };
+            torus_major_r: 0.6, torus_minor_r: 0.2,
+            tpms_period: 4.0, tpms_cells: [1.0, 1.0, 1.0] };
         let tree = build_tree(&p);
         for phi in [0.3_f32, 0.5, 0.7] {
-            let c_val = solve_c_for_vol_frac(&tree, phi, 4.0);
+            let c_val = solve_c_for_vol_frac(&tree, phi);
             let field = tree.clone() - c_val;
             let mesh = build_mesh(
                 field, "iso-test",
                 MeshBackend::MarchingCubes33, 6, 96,
-                false, 1.0, Morphology::MinimalSurface,
+                false, 1.0, Morphology::MinimalSurface, [1.0, 1.0, 1.0],
             );
             // Mean |f - C| over the mesh: should be ≈0 since vertices
             // lie on f = C  ⇔  (f − C) = 0.
@@ -2198,7 +2299,7 @@ fn main() {
         let sk_mesh = build_mesh(
             tree.clone(), "skeletal-test",
             MeshBackend::MarchingCubes33, 5, 64,
-            false, 1.0, Morphology::Skeletal,
+            false, 1.0, Morphology::Skeletal, [1.0, 1.0, 1.0],
         );
         let sk_dt = t0.elapsed();
         let sk_topo = engvis_core::topology::compute_topology(&sk_mesh);
@@ -2216,7 +2317,7 @@ fn main() {
         let t0 = std::time::Instant::now();
         let sh_mesh = build_shell_mesh(
             tree.clone(), shell_half_t, "shell-test", 96,
-            false, 1.0,
+            false, 1.0, [1.0, 1.0, 1.0],
         );
         let sh_dt = t0.elapsed();
         eprintln!(
@@ -2238,6 +2339,7 @@ fn main() {
         torus_major_r: 0.6,
         torus_minor_r: 0.2,
         tpms_period: 4.0,
+        tpms_cells: [1.0, 1.0, 1.0],
         tpms_thickness: 0.1,
         tpms_vol_frac: 0.5,
         cached_c_value: 0.0,

@@ -119,19 +119,39 @@ sub-level set
 described by the \textbf{smooth} field $g = f^2 - \delta^2$, which is
 negative \emph{inside} the wall and positive outside.
 
-\paragraph{Geometric thickness normalisation.}
+\paragraph{Geometric thickness normalisation.}\label{sec:thickness-norm}
 The user-facing parameter $t$ is a \emph{geometric} wall thickness
 (the physical distance across the wall), not a field offset.  Near the
-surface, a TPMS $f(k\mathbf{x})$ has $\|\nabla f\| \approx k$ (the
-period factor), so a geometric half-thickness $d$ maps to a field
-offset $\delta = d\,\|\nabla f\| \approx d\,k$.  engvis therefore
-sets
+surface, a TPMS $f(k\cdot\mathbf{x})$ has
+$\|\nabla f\| \approx k$, so a geometric half-thickness $d$
+maps to a field offset $\delta = d\,\|\nabla f\| \approx d\,k$.
+engvis therefore sets
 \begin{equation}\label{eq:thickness}
   \delta = \tfrac{1}{2}\, t \, k,
-  \qquad k = \text{tpms\_period},
 \end{equation}
 so that the meshed wall has true geometric thickness $\approx t$.  For
 non-TPMS surfaces, $\|\nabla f\| \approx 1$ and $k$ falls back to $1$.
+
+\paragraph{Cell replication (multi-unit-cell).}\label{sec:cell-replication}
+Two separate parameters define the TPMS geometry:
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Period $k$} --- intrinsic spatial frequency within a
+    single unit cell (e.g.\ $k=4$ for gyroid, $2$ for Fischer--Koch
+    S/Y, $3$ for most others).
+  \item \textbf{Cell counts $(n_x, n_y, n_z)$} --- how many unit cells
+    are stacked along each axis, expanding the sampling domain to
+    $[-n_x,n_x]\times[-n_y,n_y]\times[-n_z,n_z]$.
+\end{itemize}
+The TPMS formula remains $f(k\,x, k\,y, k\,z)$; the additional cells
+are obtained entirely by enlarging the domain.  This is equivalent
+(by a change of variables) to evaluating $f(k\,n_x\,x', k\,n_y\,y',
+k\,n_z\,z')$ on $[-1,1]^3$, but the domain-expanded approach keeps
+each unit cell at its natural size.  With $(n_x,n_y,n_z)=(1,1,1)$,
+the domain is $[-1,1]^3$---the classic single-cell case.  Unequal cell
+counts produce arrays of independent cells (e.g.\ $n_x=3,\ n_y=2,\
+n_z=1$ gives a domain $[-3,3]\times[-2,2]\times[-1,1]$ containing
+$3\times2\times1=6$ cells).  The bounding-box wireframe expands
+accordingly.
 
 \paragraph{Why $f^2-\delta^2$, not $|f|-\delta$.}
 Both fields share the zero-set $\{|f|=\delta\}$, but $|f|$ has a
@@ -481,16 +501,16 @@ converts $t$ into a field offset $\delta$ using the gradient magnitude
 of the implicit function near its zero-set (Eq.~\ref{eq:thickness}):
 \begin{equation}
   \delta = \tfrac{1}{2}\, t \, \|\nabla f\|,
-  \qquad \|\nabla f\| \approx k = \text{tpms\_period}.
+  \qquad \|\nabla f\| \approx k.
 \end{equation}
 
-For a TPMS evaluated as $f(k\mathbf{x})$, the chain rule gives
-$\|\nabla_{\mathbf{x}} f\| = k\,\|\nabla_{\mathbf{u}} \hat f\|$, and
+For a TPMS evaluated as $f(k\,x)$, the chain rule gives
+$\|\nabla_{\mathbf{x}} f\| = k \,\|\nabla_{\mathbf{u}} \hat f\|$, and
 the dimensionless gradient $\|\nabla_{\mathbf{u}}\hat f\|$ is $O(1)$
 on the surface for all the standard TPMS types
-(Table~\ref{tab:calibration}).  Using $k$ as a first-order estimate
-therefore yields a wall whose geometric thickness is within a few
-percent of $t$---accurate enough for visualisation and consistent
+(Table~\ref{tab:calibration}).  Using $k$ as a first-order
+estimate therefore yields a wall whose geometric thickness is within a
+few percent of $t$---accurate enough for visualisation and consistent
 across surfaces without per-surface tuning.
 
 \begin{table}[h]
@@ -625,9 +645,20 @@ pipeline.  For shell mode, the original tree is passed to
 $f^2-\delta^2$:
 
 \begin{lstlisting}
-// build_scene: geometric thickness -> field offset
-let k = self.tpms_period.max(1.0);     // |grad f| ~ k
-let shell_half_t = 0.5 * thickness * k; // delta
+// build_scene: domain extent = [nx, ny, nz]
+let [sx, sy, sz] = if is_tpms { self.tpms_cells }
+                    else { [1.0, 1.0, 1.0] };
+let max_extent = sx.max(sy).max(sz).max(1.0);
+
+// Geometric thickness -> field offset
+let grad = self.tpms_period.max(1.0);    // |grad f| ~ k
+let shell_half_t = 0.5 * thickness * grad;
+
+// Per-axis box SDF for CSG cap faces
+let half = max_extent + 4.0 / res as f32;
+let cell = 2.0 * half / (res as f32 * half).ceil();
+let (cx, cy, cz) = (sx - 0.5*cell, sy - 0.5*cell, sz - 0.5*cell);
+let box_sdf = (x.abs()-cx).max(y.abs()-cy).max(z.abs()-cz);
 
 let tree = match self.morphology {
     MinimalSurface => tree - iso_level, // f = C level-set
@@ -881,7 +912,7 @@ centroids.
 \paragraph{Topology verification.}
 After capping, the mesh topology is verified via the Euler
 characteristic $\chi = V - E + F$ and the boundary edge count.
-For the Gyroid shell (period $k=4$, thickness $t=1.0$):
+For the Gyroid shell ($k=4$, $n_x=n_y=n_z=1$, thickness $t=1.0$):
 \begin{itemize}[leftmargin=2em]
   \item \emph{Before capping}: $\chi = -20$, 4 components,
     5232 boundary edges (all on box faces), 0 interior boundaries.
@@ -936,7 +967,14 @@ panel when a TPMS surface is selected:
 
 \begin{enumerate}[leftmargin=2em]
   \item Select a TPMS surface from the dropdown (e.g.\ Gyroid).
-  \item Adjust the \textbf{Period k} slider to set the spatial frequency.
+  \item Adjust the \textbf{Period k} slider to set the intrinsic
+    spatial frequency within each unit cell (default $4$ for gyroid,
+    $2$ for Fischer--Koch, $3$ for others).
+  \item Adjust the \textbf{Unit cells nx/ny/nz} sliders to stack
+    unit cells along each axis independently.  Equal values reproduce
+    the single-cell case; unequal values produce arrays of cells
+    (e.g.\ $n_x=3,\ n_y=2,\ n_z=1$ gives $3\times2\times1=6$ cells).
+    The UI displays the total cell count $n_x\times n_y\times n_z$.
   \item Choose a morphology mode:
     \begin{itemize}
       \item \textbf{Minimal surface} ($f=0$) --- classic open sheet,
