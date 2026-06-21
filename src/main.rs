@@ -1208,6 +1208,9 @@ struct App {
     tpms_thickness: f32,
     /// 体积分数 φ ∈ [0,1]：0.5=对称极小曲面，→0/1=完全填充。
     tpms_vol_frac: f32,
+    /// 缓存的 C 值（由 tpms_vol_frac 求解得到），用于 UI 显示。
+    /// 在 remesh 时更新；初始值 0.0。
+    cached_c_value: f32,
     morphology: Morphology,
 
     // ── meshing ──
@@ -1342,6 +1345,7 @@ impl AppBuildSnapshot {
                     topology: None,
                     build_ok: false,
                     error: Some(e),
+                    c_value: 0.0,
                 };
             }
         };
@@ -1483,6 +1487,7 @@ impl AppBuildSnapshot {
             topology,
             build_ok: true,
             error: None,
+            c_value,
         }
     }
 }
@@ -1493,6 +1498,8 @@ struct MeshBuildResult {
     topology: Option<engvis_core::topology::MeshTopology>,
     build_ok: bool,
     error: Option<String>,
+    /// 由体积分数 φ 求解得到的 C 值（仅 MinimalSurface/Skeletal 有意义）。
+    c_value: f32,
 }
 
 impl App {
@@ -1523,6 +1530,7 @@ impl App {
         let result = snapshot.build_scene_result();
         self.last_topology = result.topology;
         self.last_build_ok = result.build_ok;
+        self.cached_c_value = result.c_value;
         if let Some(e) = &result.error {
             self.custom_error = Some(e.clone());
         }
@@ -1592,6 +1600,7 @@ impl EngvisApp for App {
                 self.mesh_build_result = None;
                 self.last_topology = result.topology;
                 self.last_build_ok = result.build_ok;
+                self.cached_c_value = result.c_value;
                 if let Some(e) = &result.error {
                     self.custom_error = Some(e.clone());
                     self.build_status = format!("build failed: {e}");
@@ -1931,13 +1940,18 @@ impl App {
                             0.01..=0.99).text("Volume fraction φ")).changed() {
                             self.needs_remesh = true;
                         }
+                        ui.label(format!(
+                            "  C = {:+.4}  (φ → C via sort-based inversion)",
+                            self.cached_c_value));
                     }
                     Morphology::MinimalSurface => {
                         if ui.add(egui::Slider::new(&mut self.tpms_vol_frac,
                             0.01..=0.99).text("Volume fraction φ")).changed() {
                             self.needs_remesh = true;
                         }
-                        ui.label("  φ=0.5 → minimal surface (f=0)");
+                        ui.label(format!(
+                            "  C = {:+.4}   (φ=0.5 → minimal surface f=0)",
+                            self.cached_c_value));
                     }
                 }
             });
@@ -2234,6 +2248,7 @@ fn main() {
         tpms_period: 4.0,
         tpms_thickness: 0.1,
         tpms_vol_frac: 0.5,
+        cached_c_value: 0.0,
         morphology: Morphology::MinimalSurface,
         mesh_backend: MeshBackend::MarchingCubes33,
         surf_depth: 7,
