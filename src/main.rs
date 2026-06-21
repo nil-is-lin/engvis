@@ -1368,8 +1368,8 @@ impl AppBuildSnapshot {
         // ── 体积分数 → C 值求解 ─────────────────────────────
         // 用户设置体积分数 φ，内部二分查找 C 使 vol_frac(C) = φ。
         // vol_frac(C) = |{p : f(p) < C}| / |domain|，是 C 的单调递增函数。
-        let c_value = if matches!(self.morphology,
-            Morphology::MinimalSurface | Morphology::Skeletal)
+        // 仅 Skeletal 模式使用；MinimalSurface 固定 f=0，与 C 无关。
+        let c_value = if matches!(self.morphology, Morphology::Skeletal)
         {
             solve_c_for_vol_frac(&tree, self.tpms_vol_frac, self.tpms_period)
         } else {
@@ -1377,10 +1377,8 @@ impl AppBuildSnapshot {
         };
 
         let tree = match self.morphology {
-            // Minimal surface: the iso-surface f = C (C is the user's
-            // level-set parameter; C = 0 gives the classic minimal
-            // surface).  Subtracting C shifts the zero-set to f = C.
-            Morphology::MinimalSurface => tree.clone() - c_value,
+            // Minimal surface: the classic zero level-set f = 0.
+            Morphology::MinimalSurface => tree,
             Morphology::Shell => tree,
             Morphology::Skeletal => {
                 tree.clone() - c_value
@@ -1945,13 +1943,7 @@ impl App {
                             self.cached_c_value));
                     }
                     Morphology::MinimalSurface => {
-                        if ui.add(egui::Slider::new(&mut self.tpms_vol_frac,
-                            0.01..=0.99).text("Volume fraction φ")).changed() {
-                            self.needs_remesh = true;
-                        }
-                        ui.label(format!(
-                            "  C = {:+.4}   (φ=0.5 → minimal surface f=0)",
-                            self.cached_c_value));
+                        ui.label("  f = 0  (classic minimal surface)");
                     }
                 }
             });

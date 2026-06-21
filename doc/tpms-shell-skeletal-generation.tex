@@ -90,41 +90,20 @@ shell (two offset surfaces forming a hollow wall), and skeletal
 
 \subsection{Minimal Surface Mode}
 
-The default mode extracts an iso-level-set of the TPMS function:
+The default mode extracts the zero level-set of the TPMS function:
 \begin{equation}
-  g(\mathbf{x}) = f(\mathbf{x}) - C,
+  g(\mathbf{x}) = f(\mathbf{x}),
 \end{equation}
-where $C$ is the iso-level parameter.  The meshed surface is
-$\{g = 0\} = \{f = C\}$.  Setting $C = 0$ recovers the classic minimal
-surface (the zero level-set); non-zero $C$ shifts the extracted sheet
-to a neighbouring iso-surface.
+producing the classic minimal surface $\{g = 0\} = \{f = 0\}$.
+This is a thin, open surface useful for visualisation and mathematical
+study but not directly for additive manufacturing, where finite wall
+thickness is required.
 
-\paragraph{Volume-fraction parameterisation.}\label{sec:vol-frac}
-Different TPMS functions have wildly different value ranges
-(e.g.\ gyroid $\in[-1.5,1.5]$, neovius $\in[-13,13]$), so a fixed
-$C$ slider range cannot cover all surfaces.  engvis therefore exposes
-a single \emph{volume fraction} parameter $\varphi\in(0,1)$ with
-uniform geometric semantics across all TPMS:
-\begin{equation}\label{eq:vol-frac}
-  \varphi \;=\; \frac{\bigl|\{\mathbf{x}\in[-1,1]^3 : f(\mathbf{x}) < C\}\bigr|}
-                     {|\text{domain}|}.
-\end{equation}
-The user sets $\varphi$; engvis internally solves for the
-corresponding $C$ via \emph{sort-based inversion}: sample $f$ on a
-$48^3$ grid, sort the values, and pick the $\varphi$-quantile.  This
-makes $\varphi=0.5$ the symmetric minimal surface for \emph{every}
-TPMS, and $\varphi\to0$/$\varphi\to1$ the fully filled/void limits.
-
-This produces a thin, open surface---the classic TPMS sheet.  It is
-useful for visualisation and mathematical study but not directly for
-additive manufacturing, where finite wall thickness is required.
-
-\paragraph{Shared $\varphi$ with skeletal mode.}
-The same $\varphi$ parameter drives both the minimal-surface level-set
-($f = C$) and the skeletal solid offset (\S\ref{sec:skeletal}).  This
-lets the user pick a visually pleasing iso-surface in minimal-surface
-mode and then switch directly to skeletal mode to cap it into a closed
-solid, without re-tuning the parameter.
+\paragraph{No level-set parameter.}
+Minimal-surface mode is always the zero level-set $f=0$; it does not
+expose a $C$ or $\varphi$ slider.  To explore neighbouring iso-surfaces,
+switch to \emph{skeletal} mode (\S\ref{sec:skeletal}), which solves
+$C$ from a user-specified volume fraction $\varphi$.
 
 \subsection{Shell Mode}\label{sec:shell}
 
@@ -387,7 +366,23 @@ iso-level of the TPMS function:
   g(\mathbf{x}) = f(\mathbf{x}) - C,
 \end{equation}
 where $C$ is the iso-level offset, solved from the user-facing volume
-fraction $\varphi$ as described in \S\ref{sec:vol-frac}.
+fraction $\varphi$.
+
+\paragraph{Volume-fraction parameterisation.}\label{sec:vol-frac}
+Different TPMS functions have wildly different value ranges
+(e.g.\ gyroid $\in[-1.5,1.5]$, neovius $\in[-13,13]$), so a fixed
+$C$ slider range cannot cover all surfaces.  engvis therefore exposes
+a single \emph{volume fraction} parameter $\varphi\in(0,1)$ with
+uniform geometric semantics across all TPMS:
+\begin{equation}\label{eq:vol-frac}
+  \varphi \;=\; \frac{\bigl|\{\mathbf{x}\in[-1,1]^3 : f(\mathbf{x}) < C\}\bigr|}
+                     {|\text{domain}|}.
+\end{equation}
+The user sets $\varphi$; engvis internally solves for the
+corresponding $C$ via \emph{sort-based inversion}: sample $f$ on a
+$48^3$ grid, sort the values, and pick the $\varphi$-quantile.  This
+makes $\varphi=0.5$ the symmetric minimal surface for \emph{every}
+TPMS, and $\varphi\to0$/$\varphi\to1$ the fully filled/void limits.
 
 \paragraph{Effect of $\varphi$.}
 When $\varphi = 0.5$ (i.e.\ $C$ at the median of $f$), this reduces
@@ -944,17 +939,18 @@ panel when a TPMS surface is selected:
   \item Adjust the \textbf{Period k} slider to set the spatial frequency.
   \item Choose a morphology mode:
     \begin{itemize}
-      \item \textbf{Minimal surface} ($f=C$) --- open sheet.
+      \item \textbf{Minimal surface} ($f=0$) --- classic open sheet,
+            no level-set parameter.
       \item \textbf{Shell} ($|f|-\delta=0$) --- adjust \textbf{Thickness}.
       \item \textbf{Skeletal} ($f-C=0$) --- adjust \textbf{Volume fraction $\varphi$}.
     \end{itemize}
-  \item For minimal-surface and skeletal modes, adjust the
+  \item For skeletal mode, adjust the
         \textbf{Volume fraction $\varphi$} slider ($0.01$--$0.99$).
-        $\varphi=0.5$ gives the symmetric minimal surface; lower/higher
-        values shift the iso-level to fill or empty the unit cell.
         The UI displays the solved $C$ value below the slider, e.g.\
-        ``\texttt{C = +0.5980  ($\varphi=0.5$ $\to$ minimal surface $f=0$)}'',
+        ``\texttt{C = +0.5980  ($\varphi$ $\to$ C via sort-based inversion)}'',
         so the user can see the direct mapping from $\varphi$ to $C$.
+        Minimal-surface mode has no such slider: it is always the
+        zero level-set $f=0$.
   \item Click \textbf{Re-mesh} to rebuild the surface.
 \end{enumerate}
 
