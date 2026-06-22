@@ -632,3 +632,91 @@ pub fn create_cube_mesh() -> Mesh {
         aabb,
     }
 }
+
+/// Result of mesh simplification.
+#[derive(Debug, Clone, Copy)]
+pub struct SimplifyResult {
+    pub triangles_before: usize,
+    pub triangles_after: usize,
+    pub error: f32,
+}
+
+impl Mesh {
+    /// Reduce triangle count via meshopt QEM simplification.
+    ///
+    /// `target_ratio` — fraction of triangles to keep (0.0–1.0).
+    /// `target_error` — maximum allowed geometric error (relative to mesh
+    /// extents).  A value of 0.01 preserves shape well; increase for
+    /// more aggressive decimation.
+    ///
+    /// After simplification the vertex buffer is compacted (unused
+    /// vertices removed), normals are recomputed, and the AABB is
+    /// updated.
+    pub fn simplify(&mut self, target_ratio: f32, target_error: f32) -> SimplifyResult {
+        let tri_before = self.indices.len() / 3;
+        let target_count = ((self.indices.len() as f32 * target_ratio.clamp(0.0, 1.0)) as usize)
+            .max(12)
+            .min(self.indices.len());
+
+        // Build VertexDataAdapter: stride = 48 bytes, position at offset 0.
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(&self.vertices);
+        let stride = std::mem::size_of::<MeshVertex>();
+        let vdata = meshopt::VertexDataAdapter::new(vertex_bytes, stride, 0)
+            .expect("VertexDataAdapter: invalid stride/offset");
+
+        let mut result_error: f32 = 0.0;
+        let new_indices = meshopt::simplify::simplify(
+            &self.indices,
+            &vdata,
+            target_count,
+            target_error,
+            meshopt::simplify::SimplifyOptions::LockBorder
+                | meshopt::simplify::SimplifyOptions::Prune,
+            Some(&mut result_error),
+        );
+
+        // Compact: keep only vertices referenced by new indices.
+        let mut used = vec![false; self.vertices.len()];
+        for &idx in &new_indices {
+            used[idx as usize] = true;
+        }
+        let mut remap = vec![u32::MAX; self.vertices.len()];
+        let mut new_vertices = Vec::with_capacity(used.iter().filter(|&&u| u).count());
+        for (old_idx, &is_used) in used.iter().enumerate() {
+            if is_used {
+                remap[old_idx] = new_vertices.len() as u32;
+                new_vertices.push(self.vertices[old_idx]);
+            }
+        }
+        let remapped_indices: Vec<u32> = new_indices
+            .iter()
+            .map(|&i| remap[i as usize])
+            .collect();
+
+        self.vertices = new_vertices;
+        self.indices = remapped_indices;
+
+        // Recompute area-weighted smooth normals.
+        let positions: Vec<[f32; 3]> = self.vertices.iter().map(|v| v.position).collect();
+        self.recompute_smooth_normals(&positions);
+
+        // Recompute AABB.
+        self.aabb = Aabb::empty();
+        for v in &self.vertices {
+            self.aabb.expand(glam::Vec3::from(v.position));
+        }
+
+        // Update sub-mesh index counts (single sub-mesh assumed).
+        let idx_count = self.indices.len() as u32;
+        for sub in &mut self.sub_meshes {
+            sub.index_count = idx_count;
+            sub.index_offset = 0;
+        }
+
+        SimplifyResult {
+            triangles_before: tri_before,
+            triangles_after: self.indices.len() / 3,
+            error: result_error,
+        }
+    }
+}

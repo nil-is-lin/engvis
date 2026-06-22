@@ -38,7 +38,7 @@ struct TreeParams<'a> {
     /// 各方向的晶胞堆叠数 [nx, ny, nz]。
     /// 同一个立方单元晶胞在 x/y/z 方向分别堆叠 nx/ny/nz 次，
     /// 共 nx×ny×nz 个晶胞。build_tree 使用 k·nx·x, k·ny·y, k·nz·z。
-    tpms_cells: [f32; 3],
+    tpms_cells: [u32; 3],
 }
 
 impl<'a> TreeParams<'a> {
@@ -49,7 +49,7 @@ impl<'a> TreeParams<'a> {
             "fischer-koch-s" | "fischer-koch-y" => 2.0,
             _ => 3.0,
         };
-        self.tpms_cells = [1.0, 1.0, 1.0];
+        self.tpms_cells = [1, 1, 1];
     }
 }
 
@@ -1235,7 +1235,7 @@ struct App {
     /// TPMS 内在周期 k（单个晶胞内的空间频率）。
     tpms_period: f32,
     /// 各方向晶胞堆叠数 [nx, ny, nz]；总晶胞数 = nx×ny×nz。
-    tpms_cells: [f32; 3],
+    tpms_cells: [u32; 3],
     tpms_thickness: f32,
     /// 体积分数 φ ∈ [0,1]：0.5=对称极小曲面，→0/1=完全填充。
     tpms_vol_frac: f32,
@@ -1250,6 +1250,11 @@ struct App {
     mc_res: usize,
     show_ms_loops: bool,
     show_bounding: bool,
+
+    // ── mesh simplification ──
+    simplify_enabled: bool,
+    simplify_ratio: f32,
+    simplify_stats: String,
 
     // ── edge / vertex overlay (persisted across rebuilds) ──
     show_surface_edges: bool,
@@ -1308,7 +1313,7 @@ struct AppBuildSnapshot {
     torus_major_r: f32,
     torus_minor_r: f32,
     tpms_period: f32,
-    tpms_cells: [f32; 3],
+    tpms_cells: [u32; 3],
     tpms_thickness: f32,
     /// 体积分数 φ ∈ [0,1]：0.5=对称极小曲面，→0/1=完全填充。
     /// 内部通过二分查找求解对应的 C 值（f = C 的等值面）。
@@ -1319,6 +1324,8 @@ struct AppBuildSnapshot {
     mc_res: usize,
     show_ms_loops: bool,
     show_bounding: bool,
+    simplify_enabled: bool,
+    simplify_ratio: f32,
     show_surface_edges: bool,
     surface_color: [f32; 3],
     surface_metallic: f32,
@@ -1347,6 +1354,8 @@ impl AppBuildSnapshot {
             mc_res: app.mc_res,
             show_ms_loops: app.show_ms_loops,
             show_bounding: app.show_bounding,
+            simplify_enabled: app.simplify_enabled,
+            simplify_ratio: app.simplify_ratio,
             show_surface_edges: app.show_surface_edges,
             surface_color: app.surface_color,
             surface_metallic: app.surface_metallic,
@@ -1398,6 +1407,7 @@ impl AppBuildSnapshot {
                     error: Some(e),
                     c_value: 0.0,
                     build_stats: String::new(),
+                    simplify_stats: String::new(),
                 };
             }
         };
@@ -1466,11 +1476,11 @@ impl AppBuildSnapshot {
         let domain_extent = if matches!(&self.source,
             SurfaceSource::BuiltIn(n) if TPMS_SURFACES.iter().any(|(k,_)| k == n))
         {
-            self.tpms_cells
+            [self.tpms_cells[0] as f32, self.tpms_cells[1] as f32, self.tpms_cells[2] as f32]
         } else {
             [1.0, 1.0, 1.0]
         };
-        let (mesh, build_stats) = if matches!(self.morphology, Morphology::Shell) {
+        let (mut mesh, mut build_stats) = if matches!(self.morphology, Morphology::Shell) {
             build_shell_mesh(
                 tree.clone(), shell_half_t, &label, effective_res,
                 self.clip_to_unit_ball, self.clip_radius, domain_extent,
@@ -1483,6 +1493,19 @@ impl AppBuildSnapshot {
                 self.morphology, domain_extent,
             )
         };
+
+        // ── Optional mesh simplification (QEM decimation) ──
+        let mut simplify_stats = String::new();
+        if self.simplify_enabled && self.simplify_ratio < 1.0 {
+            let result = mesh.simplify(self.simplify_ratio, 0.01);
+            let stats_line = format!(
+                "{} -> {} tris (error {:.4})",
+                result.triangles_before, result.triangles_after, result.error
+            );
+            simplify_stats = stats_line.clone();
+            build_stats.push_str(&format!("  |  simplified: {}", stats_line));
+        }
+
         let topology = Some(compute_topology(&mesh));
 
         let mat = PbrMaterial {
@@ -1530,7 +1553,7 @@ impl AppBuildSnapshot {
                 let extent = if matches!(&self.source,
                     SurfaceSource::BuiltIn(n) if TPMS_SURFACES.iter().any(|(k,_)| k == n))
                 {
-                    self.tpms_cells
+                    [self.tpms_cells[0] as f32, self.tpms_cells[1] as f32, self.tpms_cells[2] as f32]
                 } else {
                     [1.0, 1.0, 1.0]
                 };
@@ -1560,6 +1583,7 @@ impl AppBuildSnapshot {
             error: None,
             c_value,
             build_stats,
+            simplify_stats,
         }
     }
 }
@@ -1574,6 +1598,8 @@ struct MeshBuildResult {
     c_value: f32,
     /// Human-readable build statistics for the status bar.
     build_stats: String,
+    /// Simplification stats string for the mesh panel.
+    simplify_stats: String,
 }
 
 impl App {
@@ -1680,6 +1706,7 @@ impl EngvisApp for App {
                     self.custom_error = None;
                     self.build_status = "ready".into();
                     self.build_stats = result.build_stats;
+                    self.simplify_stats = result.simplify_stats;
                 }
                 *frame.scene = result.scene;
                 // Fit camera to new scene bounds.
@@ -2020,29 +2047,29 @@ impl App {
                     ui.end_row();
 
                     ui.label("Cells x");
-                    if ui.add(egui::Slider::new(&mut self.tpms_cells[0], 1.0..=10.0)
-                        .step_by(1.0)).changed() {
+                    if ui.add(egui::Slider::new(&mut self.tpms_cells[0], 1..=10)
+                        .text("")).changed() {
                         self.needs_remesh = true;
                     }
                     ui.end_row();
 
                     ui.label("Cells y");
-                    if ui.add(egui::Slider::new(&mut self.tpms_cells[1], 1.0..=10.0)
-                        .step_by(1.0)).changed() {
+                    if ui.add(egui::Slider::new(&mut self.tpms_cells[1], 1..=10)
+                        .text("")).changed() {
                         self.needs_remesh = true;
                     }
                     ui.end_row();
 
                     ui.label("Cells z");
-                    if ui.add(egui::Slider::new(&mut self.tpms_cells[2], 1.0..=10.0)
-                        .step_by(1.0)).changed() {
+                    if ui.add(egui::Slider::new(&mut self.tpms_cells[2], 1..=10)
+                        .text("")).changed() {
                         self.needs_remesh = true;
                     }
                     ui.end_row();
                 });
             let total = self.tpms_cells[0] * self.tpms_cells[1] * self.tpms_cells[2];
             ui.label(egui::RichText::new(
-                format!("{:.0} x {:.0} x {:.0} = {:.0} cells",
+                format!("{} x {} x {} = {} cells",
                     self.tpms_cells[0], self.tpms_cells[1],
                     self.tpms_cells[2], total))
                 .small().color(ui.visuals().weak_text_color()));
@@ -2187,6 +2214,28 @@ impl App {
         if ui.button("Re-mesh").clicked() {
             self.needs_remesh = true;
         }
+
+        // ── Mesh simplification ──
+        ui.add_space(12.0);
+        ui.separator();
+        ui.label("Simplification (QEM decimation):");
+        if ui.checkbox(&mut self.simplify_enabled, "Enable simplification").changed() {
+            self.needs_remesh = true;
+        }
+        if self.simplify_enabled {
+            if ui.add(egui::Slider::new(&mut self.simplify_ratio, 0.01..=1.0)
+                .text("Target ratio")
+                .show_value(true)).changed() {
+                self.needs_remesh = true;
+            }
+            if !self.simplify_stats.is_empty() {
+                ui.label(
+                    egui::RichText::new(&self.simplify_stats)
+                        .size(11.0)
+                        .color(egui::Color32::GRAY),
+                );
+            }
+        }
     }
 
     fn ui_display(&mut self, ui: &mut egui::Ui,
@@ -2328,7 +2377,7 @@ fn main() {
             let p2 = TreeParams {
                 name, sphere_radius: 0.8,
                 torus_major_r: 0.6, torus_minor_r: 0.2,
-                tpms_period: 4.0, tpms_cells: [1.0, 1.0, 1.0],
+                tpms_period: 4.0, tpms_cells: [1, 1, 1],
             };
             let tree2 = build_tree(&p2);
             use fidget_core::shape::Shape;
@@ -2364,7 +2413,7 @@ fn main() {
         // the zero-set, producing a different mesh.
         let p = TreeParams { name: "gyroid", sphere_radius: 0.8,
             torus_major_r: 0.6, torus_minor_r: 0.2,
-            tpms_period: 4.0, tpms_cells: [1.0, 1.0, 1.0] };
+            tpms_period: 4.0, tpms_cells: [1, 1, 1] };
         let tree = build_tree(&p);
         for phi in [0.3_f32, 0.5, 0.7] {
             let c_val = solve_c_for_vol_frac(&tree, phi);
@@ -2440,7 +2489,7 @@ fn main() {
         torus_major_r: 0.6,
         torus_minor_r: 0.2,
         tpms_period: 4.0,
-        tpms_cells: [1.0, 1.0, 1.0],
+        tpms_cells: [1, 1, 1],
         tpms_thickness: 0.1,
         tpms_vol_frac: 0.5,
         cached_c_value: 0.0,
@@ -2450,6 +2499,9 @@ fn main() {
         mc_res: 64,
         show_ms_loops: false,
         show_bounding: true,
+        simplify_enabled: false,
+        simplify_ratio: 0.25,
+        simplify_stats: String::new(),
         show_surface_edges: false,
         edge_color: [0.35, 0.35, 0.35],
         edge_line_width: 2.0,
