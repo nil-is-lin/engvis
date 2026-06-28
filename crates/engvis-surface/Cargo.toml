@@ -1,0 +1,11 @@
+[package]
+name = "engvis-surface"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Implicit surface definitions and TPMS formula library for engvis"
+
+[dependencies]
+fidget-core.workspace = true
+fidget-rhai.workspace = true

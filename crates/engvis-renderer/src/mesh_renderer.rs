@@ -5,7 +5,7 @@ use glam::{Affine3A, Mat4};
 pub struct MeshBuffer {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
-    pub edge_endpoint_buffer: wgpu::Buffer,
+    pub edge_endpoint_buffer: Option<wgpu::Buffer>,
     pub index_count: u32,
     pub edge_instance_count: u32,
     pub vertex_count: u32,
@@ -83,19 +83,34 @@ impl MeshRenderer {
                 pos_b: mesh.vertices[i1].position,
             });
         }
-        let edge_endpoint_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(&format!("Mesh '{}' Edge Endpoint Buffer", mesh.name)),
-            contents: bytemuck::cast_slice(&edge_endpoints),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let edge_endpoint_buffer = {
+            let byte_size = edge_count * std::mem::size_of::<EdgeEndpoints>();
+            let max_buffer_size = device.limits().max_buffer_size as usize;
+            if byte_size > max_buffer_size {
+                log::warn!(
+                    "Mesh '{}' edge buffer {} MB exceeds GPU limit {} MB, skipping edges",
+                    mesh.name,
+                    byte_size / (1024 * 1024),
+                    max_buffer_size / (1024 * 1024),
+                );
+                None
+            } else {
+                Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("Mesh '{}' Edge Endpoint Buffer", mesh.name)),
+                    contents: bytemuck::cast_slice(&edge_endpoints),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }))
+            }
+        };
 
+        let has_edges = edge_endpoint_buffer.is_some();
         let index = self.mesh_buffers.len();
         self.mesh_buffers.push(MeshBuffer {
             vertex_buffer,
             index_buffer,
             edge_endpoint_buffer,
             index_count: mesh.indices.len() as u32,
-            edge_instance_count: edge_count as u32,
+            edge_instance_count: if has_edges { edge_count as u32 } else { 0 },
             vertex_count: mesh.vertices.len() as u32,
         });
         index

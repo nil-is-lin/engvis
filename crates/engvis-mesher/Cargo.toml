@@ -1,0 +1,15 @@
+[package]
+name = "engvis-mesher"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Mesh generation algorithms (DC, MC33, shell, MS-loops) for engvis"
+
+[dependencies]
+engvis-surface = { path = "../engvis-surface" }
+engvis-core = { path = "../engvis-core" }
+fidget-core.workspace = true
+fidget-jit.workspace = true
+fidget-mesh.workspace = true
+glam.workspace = true

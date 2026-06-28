@@ -11,6 +11,8 @@ readme = "README.md"
 [dependencies]
 engvis-core = { path = "crates/engvis-core" }
 engvis-renderer = { path = "crates/engvis-renderer" }
+engvis-surface = { path = "crates/engvis-surface" }
+engvis-mesher = { path = "crates/engvis-mesher" }
 wgpu.workspace = true
 winit.workspace = true
 egui.workspace = true
@@ -35,6 +37,8 @@ resolver = "2"
 members = [
     "crates/engvis-core",
     "crates/engvis-renderer",
+    "crates/engvis-surface",
+    "crates/engvis-mesher",
     "fidget-demo", "examples/colorbar3d",
 ]
 

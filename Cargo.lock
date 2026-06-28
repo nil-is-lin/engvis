@@ -1113,7 +1113,9 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "engvis-core",
+ "engvis-mesher",
  "engvis-renderer",
+ "engvis-surface",
  "env_logger",
  "fidget-core",
  "fidget-jit",
@@ -1143,6 +1145,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "engvis-mesher"
+version = "0.1.5"
+dependencies = [
+ "engvis-core",
+ "engvis-surface",
+ "fidget-core",
+ "fidget-jit",
+ "fidget-mesh",
+ "glam 0.30.10",
+]
+
+[[package]]
 name = "engvis-renderer"
 version = "0.1.5"
 dependencies = [
@@ -1158,6 +1172,14 @@ dependencies = [
  "pollster",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "engvis-surface"
+version = "0.1.5"
+dependencies = [
+ "fidget-core",
+ "fidget-rhai",
 ]
 
 [[package]]

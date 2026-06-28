@@ -1,5 +1,4 @@
-// ── engvis viewer ──────────────────────────────────────────
-// Dual Contouring + Marching Cubes 33 meshing of implicit surfaces
+// engvis viewer — Dual Contouring + Marching Cubes 33 meshing of implicit surfaces
 // with boundary smoothing and MS-loop visualization.
 
 mod mesh_io;
@@ -9,1162 +8,119 @@ use engvis_core::{
     material::PbrMaterial,
     scene::{Scene, SceneNode},
     camera::OrbitCamera,
-    mesh::Mesh,
-    marching_cubes,
     topology::compute_topology,
-    Aabb, SubMesh, MeshVertex,
+    Aabb,
 };
 use engvis_renderer::{
     EngvisApp, AppCtx, FrameCtx, RunConfig, EventHandling, load_gltf,
+};
+use engvis_surface::{
+    GradientField, GradientMode, TreeParams, Morphology,
+    SurfaceType, tpms_formula, build_tree, build_tree_from_rhai,
+};
+use engvis_mesher::{
+    MeshBackend, build_box_wireframe, build_sphere_wireframe,
+    build_shell_mesh, build_mesh, build_ms_loops_mesh,
 };
 
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-// =====================================================================
-// 1. Implicit surface definition (shared by DC and MC33)
-// =====================================================================
-
-/// Parameters for building an implicit surface tree.
-#[derive(Clone, Debug)]
-struct TreeParams<'a> {
-    name: &'a str,
-    sphere_radius: f32,
-    torus_major_r: f32,
-    torus_minor_r: f32,
-    /// TPMS 内在周期 k（单位晶胞内的空间频率）。
-    /// 例如默认 gyroid 为 4，即一个单位立方体内有 4 个周期。
-    tpms_period: f32,
-    /// 各方向的晶胞堆叠数 [nx, ny, nz]。
-    /// 同一个立方单元晶胞在 x/y/z 方向分别堆叠 nx/ny/nz 次，
-    /// 共 nx×ny×nz 个晶胞。build_tree 使用 k·nx·x, k·ny·y, k·nz·z。
-    tpms_cells: [u32; 3],
-}
-
-impl<'a> TreeParams<'a> {
-    /// Set sensible defaults when switching to a TPMS surface.
-    fn set_tpms_defaults(&mut self, name: &str) {
-        self.tpms_period = match name {
-            "gyroid" => 4.0,
-            "fischer-koch-s" | "fischer-koch-y" => 2.0,
-            _ => 3.0,
-        };
-        self.tpms_cells = [1, 1, 1];
-    }
-}
-
-/// Morphology mode for TPMS surfaces.
-///
-/// * **MinimalSurface** — direct iso-surface $f(\mathbf{x})=0$ (the classic open sheet).
-/// * **Shell** — two offset surfaces $f^2 - (t'/2)^2 = 0$ producing a hollow wall.
-/// * **Skeletal** — shifted iso-level $f - C = 0$ producing a solid strut network.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Morphology {
-    /// Classic open surface f = 0.
-    MinimalSurface,
-    /// Thick shell: f² − (t/2)² = 0.
-    Shell,
-    /// Solid skeletal network: f − C = 0.
-    Skeletal,
-}
-
-/// Built-in implicit surfaces. Each name maps to a Fidget `Tree`.
-///
-/// The TPMS formula uses $f(k·x, k·y, k·z)$ where $k$ is the intrinsic
-/// period.  Multiple unit cells are realised by expanding the *sampling
-/// domain* (see [`build_mc33_mesh_domain`]), not by scaling the formula.
-fn build_tree(p: &TreeParams) -> fidget_core::context::Tree {
-    use fidget_core::context::Tree as T;
-    let k = p.tpms_period;
-    let s = move |f: f32| -> (T, T, T) { (T::x() * f, T::y() * f, T::z() * f) };
-    match p.name {
-        "sphere" => (T::x().square() + T::y().square() + T::z().square()).sqrt()
-          - p.sphere_radius,
-        "torus" => {
-            let major = T::x().square() + T::y().square();
-            (major.sqrt() - p.torus_major_r).square() + T::z().square()
-          - p.torus_minor_r * p.torus_minor_r
-        }
-        "gyroid" => {
-            let (x, y, z) = s(k);
-            x.clone().sin() * y.clone().cos()
-          + y.clone().sin() * z.clone().cos()
-          + z.clone().sin() * x.clone().cos()
-        }
-        "schwarz-p" => {
-            let (x, y, z) = s(k);
-            x.cos() + y.cos() + z.cos()
-        }
-        "schwarz-d" => {
-            let (x, y, z) = s(k);
-            let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
-            let (cx, cy, cz) = (x.cos(), y.cos(), z.cos());
-            sx.clone()*sy.clone()*sz.clone()
-          + sx.clone()*cy.clone()*cz.clone()
-          + cx.clone()*sy.clone()*cz.clone()
-          + cx*cy*sz
-        }
-        "schoen-iwp" => {
-            let (x, y, z) = s(k);
-            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
-            let (c2x, c2y, c2z) = ((x*2.0).cos(), (y*2.0).cos(), (z*2.0).cos());
-            (cx.clone()*cy.clone() + cy*cz.clone() + cz*cx) * 2.0
-          - (c2x + c2y + c2z)
-        }
-        "neovius" => {
-            let (x, y, z) = s(k);
-            let (cx, cy, cz) = (x.cos(), y.cos(), z.cos());
-            (cx.clone() + cy.clone() + cz.clone()) * 3.0
-          + cx*cy*cz * 4.0
-        }
-        "f-rd" => {
-            let (x, y, z) = s(k);
-            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
-            let (c2x, c2y, c2z) = ((x*2.0).cos(), (y*2.0).cos(), (z*2.0).cos());
-            cx*cy*cz * 4.0
-          - (c2x.clone()*c2y.clone() + c2y*c2z.clone() + c2z*c2x)
-        }
-        "lidinoid" => {
-            let (x, y, z) = s(k);
-            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
-            let (s2x, s2y, s2z) = ((x.clone()*2.0).sin(), (y.clone()*2.0).sin(), (z.clone()*2.0).sin());
-            let (c2x, c2y, c2z) = ((x*2.0).cos(), (y*2.0).cos(), (z*2.0).cos());
-            (s2x.clone()*cy.clone()*s2z.clone()
-           + s2y.clone()*cz.clone()*s2x.clone()
-           + s2z.clone()*cx.clone()*s2y.clone()) * 0.5
-          - (c2x.clone()*c2y.clone() + c2y*c2z.clone() + c2z*c2x) * 0.5
-          + 0.15
-        }
-        "split-p" => {
-            let (x, y, z) = s(k);
-            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
-            let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
-            let (s2x, s2y, s2z) = ((x.clone()*2.0).sin(), (y.clone()*2.0).sin(), (z.clone()*2.0).sin());
-            let (c2x, c2y, c2z) = ((x*2.0).cos(), (y*2.0).cos(), (z*2.0).cos());
-            (s2x.clone()*cy.clone()*sz.clone()
-           + sx.clone()*s2y.clone()*cz.clone()
-           + cx.clone()*sy.clone()*s2z.clone()) * 1.1
-          - (c2x.clone()*c2y.clone() + c2y.clone()*c2z.clone() + c2z.clone()*c2x.clone()) * 0.2
-          - (c2x + c2y + c2z) * 0.4
-        }
-        "fischer-koch-s" => {
-            let (x, y, z) = s(k);
-            let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
-            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
-            let (c2x, c2y, c2z) = ((x*2.0).cos(), (y*2.0).cos(), (z*2.0).cos());
-            c2x*sy.clone()*cz.clone()
-          + c2y*sz.clone()*cx.clone()
-          + c2z*sx*cy
-        }
-        "fischer-koch-y" => {
-            let (x, y, z) = s(k);
-            let (sx, sy, sz) = (x.clone().sin(), y.clone().sin(), z.clone().sin());
-            let (cx, cy, cz) = (x.clone().cos(), y.clone().cos(), z.clone().cos());
-            let (s2x, s2y, s2z) = ((x*2.0).sin(), (y*2.0).sin(), (z*2.0).sin());
-            cx*cy*cz * 2.0
-          + s2x*sy.clone() + s2y*sz.clone() + s2z*sx
-        }
-        "fischer-koch-cp" => {
-            let (x, y, z) = s(k);
-            let (cx, cy, cz) = (x.cos(), y.cos(), z.cos());
-            cx.clone() + cy.clone() + cz.clone() + cx*cy*cz * 4.0
-        }
-        _ => {
-            let (x, y, z) = s(4.0);
-            x.clone().sin() * y.clone().cos()
-          + y.clone().sin() * z.clone().cos()
-          + z.clone().sin() * x.clone().cos()
-        }
-    }
-}
-
-/// Human-readable formula for a TPMS surface (shown in the UI).
-fn tpms_formula(name: &str) -> &str {
-    match name {
-        "gyroid"          => "sin(kx)cos(ky) + sin(ky)cos(kz) + sin(kz)cos(kx) = 0",
-        "schwarz-p"       => "cos(kx) + cos(ky) + cos(kz) = 0",
-        "schwarz-d"       => "sin(kx)sin(ky)sin(kz) + sin(kx)cos(ky)cos(kz)\n  + cos(kx)sin(ky)cos(kz) + cos(kx)cos(ky)sin(kz) = 0",
-        "schoen-iwp"      => "2[cos(kx)cos(ky)+cos(ky)cos(kz)+cos(kz)cos(kx)]\n  - [cos(2kx)+cos(2ky)+cos(2kz)] = 0",
-        "neovius"         => "3[cos(kx)+cos(ky)+cos(kz)] + 4cos(kx)cos(ky)cos(kz) = 0",
-        "f-rd"            => "4cos(kx)cos(ky)cos(kz) - [cos(2kx)cos(2ky)\n  + cos(2ky)cos(2kz) + cos(2kz)cos(2kx)] = 0",
-        "lidinoid"        => "(1/2)[sin(2kx)cos(ky)sin(kz) + ...]\n  - (1/2)[cos(2kx)cos(2ky) + ...] + 0.15 = 0",
-        "split-p"         => "1.1[sin(2kx)cos(ky)sin(kz) + ...]\n  - 0.2[cos(2kx)cos(2ky) + ...]\n  - 0.4[cos(2kx)+cos(2ky)+cos(2kz)] = 0",
-        "fischer-koch-s"  => "cos(2kx)sin(ky)cos(kz) + cos(2ky)sin(kz)cos(kx)\n  + cos(2kz)sin(kx)cos(ky) = 0",
-        "fischer-koch-y"  => "2cos(kx)cos(ky)cos(kz) + sin(2kx)sin(ky)\n  + sin(2ky)sin(kz) + sin(2kz)sin(kx) = 0",
-        "fischer-koch-cp" => "cos(kx)+cos(ky)+cos(kz) + 4cos(kx)cos(ky)cos(kz) = 0",
-        _ => "(unknown)",
-    }
-}
-
-/// Compile a Rhai script that returns a `Tree` (the user-typed implicit
-/// expression).  Powered by `fidget-rhai`, which already exposes `x, y, z`
-/// and full math (sin/cos/sqrt/...) as overloaded operators on Tree.
-fn build_tree_from_rhai(src: &str) -> Result<fidget_core::context::Tree, String> {
-    let engine = fidget_rhai::engine();
-    let tree: fidget_core::context::Tree = engine
-        .eval(src)
-        .map_err(|e| format!("{e}"))?;
-    Ok(tree)
-}
-
-// =====================================================================
-// Diagnostic: classify boundary edges as on-box-face or interior.
-// =====================================================================
-
-/// Analyse boundary edges of a mesh in [-1,1]³ and classify them as:
-///   - **box-face**: both endpoints lie on the same face of [-1,1]³
-///   - **interior**: at least one endpoint is strictly inside the box
-#[allow(dead_code)]
-fn classify_boundary_edges(mesh: &Mesh, tag: &str) {
-    use std::collections::HashMap;
-    let v = mesh.vertices.len();
-    let f = mesh.indices.len() / 3;
-
-    // edge → face count
-    let mut edge_faces: HashMap<(u32, u32), usize> = HashMap::with_capacity(f * 3);
-    for tri in mesh.indices.chunks_exact(3) {
-        let (a, b, c) = (tri[0], tri[1], tri[2]);
-        for &(i0, i1) in &[(a, b), (b, c), (c, a)] {
-            let key = if i0 <= i1 { (i0, i1) } else { (i1, i0) };
-            *edge_faces.entry(key).or_default() += 1;
-        }
-    }
-
-    let tol = 0.02; // tolerance for "on box face"
-    let mut on_box_face = 0usize;
-    let mut interior = 0usize;
-
-    for &(a, b) in edge_faces.keys() {
-        if edge_faces[&(a, b)] != 1 { continue; }
-        let pa = mesh.vertices[a as usize].position;
-        let pb = mesh.vertices[b as usize].position;
-        let on_face = |p: [f32; 3]| -> bool {
-            p[0].abs() > 1.0 - tol || p[1].abs() > 1.0 - tol || p[2].abs() > 1.0 - tol
-        };
-        if on_face(pa) && on_face(pb) {
-            on_box_face += 1;
-        } else {
-            interior += 1;
-        }
-    }
-
-    let topo = compute_topology(mesh);
-    eprintln!(
-        "  [diag:{tag}] V={} F={} χ={} components={} | boundary_edges: {} on_box_face, {} interior | non_manifold={}",
-        v, f, topo.euler, topo.connected_components,
-        on_box_face, interior, topo.non_manifold_edges,
-    );
-}
-
-// =====================================================================
-// 2a. Dual Contouring — sharp features, jagged boundary
-// =====================================================================
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MeshBackend { MarchingCubes33, DualContouring }
-
-fn build_dc_mesh(tree: fidget_core::context::Tree, name: &str, depth: u8) -> (Mesh, String) {
-    use fidget_core::shape::Shape;
-    use fidget_jit::JitFunction;
-    use fidget_mesh::{Octree, Settings};
-
-    let shape = Shape::<JitFunction>::from(tree);
-    let settings = Settings {
-        depth,
-        threads: Some(&fidget_core::render::ThreadPool::Global),
-        ..Default::default()
-    };
-    let octree = Octree::build(&shape, &settings).expect("octree");
-    let m = octree.walk_dual();
-
-    let pos: Vec<[f32; 3]> = m.vertices.iter().map(|v| [v.x, v.y, v.z]).collect();
-    let idx: Vec<u32> = m
-        .triangles
-        .iter()
-        .flat_map(|t| [t.x as u32, t.y as u32, t.z as u32])
-        .collect();
-    let stats = format!("[DC] {} verts, {} tris (depth={})", pos.len(), idx.len() / 3, depth);
-
-    // Step 1: Fix DC winding holes via full pipeline (dedup + BFS +
-    // geometric flip fix).  This must happen BEFORE smooth_boundary_ms,
-    // because BFS would flip the boundary fan triangles added later.
-    let tmp = Mesh::from_triangles("tmp", &pos, &idx);
-    let mut pos: Vec<[f32; 3]> = tmp.vertices.iter().map(|v| v.position).collect();
-    let mut idx: Vec<u32> = tmp.indices.clone();
-
-    // Step 2: Smooth the open-boundary silhouette by moving boundary
-    // vertices onto the true curve C = (box face) ∩ {f=0}.
-    smooth_boundary_ms(&shape, &mut pos, &mut idx);
-
-    // Step 3: Build final mesh WITHOUT winding fix (boundary fan winding
-    // is already correct from step 2).
-    let mut mesh = Mesh::from_triangles_open(name, &pos, &idx);
-    overwrite_normals_with_gradient(&shape, &mut mesh);
-    (mesh, stats)
-}
-
-// =====================================================================
-// 2b. Marching Cubes 33 — boundary naturally smooth
-// =====================================================================
-
-/// Samples the axis-aligned box
-/// `[-sx,sx] × [-sy,sy] × [-sz,sz]` where `extent = [sx, sy, sz]`.
-///
-/// For `extent = [1,1,1]` this is the classic unit cube.  Larger
-/// extents expand the domain (e.g. for multi-unit-cell TPMS) while
-/// keeping grid-cell size approximately constant by scaling the
-/// resolution with `max(sx, sy, sz)`.
-fn build_mc33_mesh_domain(
-    tree: fidget_core::context::Tree,
-    name: &str,
-    res: usize,
-    extent: [f32; 3],
-) -> (Mesh, String) {
-    use fidget_core::shape::Shape;
-    use fidget_jit::JitFunction;
-
-    let t_shape = std::time::Instant::now();
-    let shape = Shape::<JitFunction>::from(tree);
-
-    // Scale base resolution with the largest extent so cell size
-    // stays ~constant regardless of the number of stacked unit cells.
-    let max_extent = extent.iter().cloned().fold(1.0_f32, f32::max);
-    let base_res = ((res as f32) * max_extent).ceil() as usize;
-
-    let float_tape = shape.float_slice_tape(Default::default());
-    let dt_shape = t_shape.elapsed();
-
-    // ── Batch grid evaluation ────────────────────────────────────
-    //
-    // Instead of calling f() per grid point (which creates a new fidget
-    // evaluator each time), we build coordinate arrays for the entire
-    // grid and evaluate them in a single float_slice_eval call.
-    // For res=256 this replaces ~17M individual evaluator creations
-    // with a single batch evaluation.
-    let (x0, x1, y0, y1, z0, z1) = (-extent[0], extent[0], -extent[1], extent[1], -extent[2], extent[2]);
-    // Grid counts proportional to per-axis extent, keeping cell size ~uniform.
-    let inv_max = 1.0 / max_extent;
-    let nx = ((base_res as f32) * extent[0] * inv_max).ceil() as usize;
-    let ny = ((base_res as f32) * extent[1] * inv_max).ceil() as usize;
-    let nz = ((base_res as f32) * extent[2] * inv_max).ceil() as usize;
-    let dx = (x1 - x0) / nx as f32;
-    let dy = (y1 - y0) / ny as f32;
-    let dz = (z1 - z0) / nz as f32;
-    let stride_y = ny + 1;
-    let stride_z = nz + 1;
-    let total = (nx + 1) * stride_y * stride_z;
-
-    let t_grid = std::time::Instant::now();
-    let mut xs = Vec::with_capacity(total);
-    let mut ys = Vec::with_capacity(total);
-    let mut zs = Vec::with_capacity(total);
-    for ix in 0..=nx {
-        let x = x0 + ix as f32 * dx;
-        for iy in 0..=ny {
-            let y = y0 + iy as f32 * dy;
-            for iz in 0..=nz {
-                xs.push(x);
-                ys.push(y);
-                zs.push(z0 + iz as f32 * dz);
-            }
-        }
-    }
-    let dt_build = t_grid.elapsed();
-
-    let t_eval = std::time::Instant::now();
-    let grid = {
-        let mut eval = Shape::<JitFunction>::new_float_slice_eval();
-        match eval.eval(&float_tape, &xs, &ys, &zs) {
-            Ok(r) => r.to_vec(),
-            Err(_) => vec![1e9_f32; total],
-        }
-    };
-    let dt_eval = t_eval.elapsed();
-
-    // Per-point closure for ambiguous-face resolution and winding fix
-    // gradient (rare calls, not worth batching).
-    let point_eval = {
-        let tape = float_tape.clone();
-        move |x: f32, y: f32, z: f32| -> f32 {
-            let mut eval = Shape::<JitFunction>::new_float_slice_eval();
-            match eval.eval(&tape, &[x], &[y], &[z]) {
-                Ok(r) => r[0],
-                Err(_) => 1e9,
-            }
-        }
-    };
-
-    let t_extract = std::time::Instant::now();
-    let (mut pos, idx) = marching_cubes::extract_par_with_grid(
-        point_eval,
-        &grid,
-        (x0, x1, nx),
-        (y0, y1, ny),
-        (z0, z1, nz),
-    );
-    let dt_extract = t_extract.elapsed();
-    // For the classic unit-cube (non-padded) path, clamp stray vertices
-    // back to [-1,1]³.  For padded box-CSG solids the surface may
-    // legitimately extend slightly beyond the box—clamping would create
-    // non-manifold edges, so skip it.
-    let is_unit = (extent[0] - 1.0).abs() < 1e-6
-               && (extent[1] - 1.0).abs() < 1e-6
-               && (extent[2] - 1.0).abs() < 1e-6;
-    let mut out_of_bounds = 0usize;
-    if is_unit {
-        for p in &mut pos {
-            for v in &mut *p {
-                if *v < -1.0 { *v = -1.0; out_of_bounds += 1; }
-                if *v >  1.0 { *v =  1.0; out_of_bounds += 1; }
-            }
-        }
-    }
-
-    // extract_par's gradient-based winding fix uses the (possibly
-    // composite) field's gradient, which can be zero at CSG creases
-    // (e.g. f²−half_t² at f=0).  Run the full BFS winding fix here
-    // to propagate consistent winding across all faces, fixing any
-    // triangles that the gradient fix skipped.
-    let t_mesh = std::time::Instant::now();
-    let mut mesh = Mesh::from_triangles(name, &pos, &idx);
-    let dt_mesh = t_mesh.elapsed();
-    let t_norm = std::time::Instant::now();
-    overwrite_normals_with_gradient(&shape, &mut mesh);
-    let dt_norm = t_norm.elapsed();
-    let clamped_msg = if is_unit && out_of_bounds > 0 {
-        format!(" | clamped {} coords", out_of_bounds)
-    } else {
-        String::new()
-    };
-    let stats = format!(
-        "[MC33] {} verts, {} tris (res={}){} | shape={:.0}ms grid={:.0}ms eval={:.0}ms extract={:.0}ms mesh={:.0}ms normals={:.0}ms",
-        pos.len(), idx.len() / 3, res, clamped_msg,
-        dt_shape.as_secs_f64() * 1e3,
-        dt_build.as_secs_f64() * 1e3, dt_eval.as_secs_f64() * 1e3,
-        dt_extract.as_secs_f64() * 1e3, dt_mesh.as_secs_f64() * 1e3,
-        dt_norm.as_secs_f64() * 1e3,
-    );
-    (mesh, stats)
-}
-
-/// Used after `clip_mesh_to_ball` which creates new vertices with
-/// zero normals.
-fn recompute_smooth_normals(mesh: &mut Mesh) {
-    let n = mesh.vertices.len();
-    let mut normals = vec![[0.0_f32; 3]; n];
-    for tri in mesh.indices.chunks_exact(3) {
-        let i0 = tri[0] as usize;
-        let i1 = tri[1] as usize;
-        let i2 = tri[2] as usize;
-        let p0 = glam::Vec3::from(mesh.vertices[i0].position);
-        let p1 = glam::Vec3::from(mesh.vertices[i1].position);
-        let p2 = glam::Vec3::from(mesh.vertices[i2].position);
-        let nrm = (p1 - p0).cross(p2 - p0);
-        for &i in &[i0, i1, i2] {
-            normals[i][0] += nrm.x;
-            normals[i][1] += nrm.y;
-            normals[i][2] += nrm.z;
-        }
-    }
-    for (vert, norm) in mesh.vertices.iter_mut().zip(normals.iter()) {
-        let len = (norm[0]*norm[0] + norm[1]*norm[1] + norm[2]*norm[2]).sqrt();
-        vert.normal = if len > 1e-10 {
-            let inv = 1.0 / len;
-            [norm[0]*inv, norm[1]*inv, norm[2]*inv]
-        } else {
-            [0.0, 1.0, 0.0]
-        };
-    }
-}
-
-/// Build a wireframe with outer box + internal cell-boundary grid lines.
-///
-/// For `extent = [nx, ny, nz]` (unit cells per axis), the outer box is
-/// `[-nx,nx]×[-ny,ny]×[-nz,nz]` and internal divider lines are drawn at
-/// each cell boundary, making the unit-cell structure visually obvious.
-fn build_box_wireframe(extent: [f32; 3]) -> Mesh {
-    let [sx, sy, sz] = extent;
-    let pts: [[f32;3]; 8] = [
-        [-sx,-sy,-sz], [ sx,-sy,-sz], [ sx, sy,-sz], [-sx, sy,-sz],
-        [-sx,-sy, sz], [ sx,-sy, sz], [ sx, sy, sz], [-sx, sy, sz],
-    ];
-    let outer_edges = [
-        (0,1),(1,2),(2,3),(3,0), // bottom
-        (4,5),(5,6),(6,7),(7,4), // top
-        (0,4),(1,5),(2,6),(3,7), // verticals
-    ];
-
-    let mut positions = Vec::new();
-    let mut indices = Vec::new();
-    let mut push_edge = |p0: [f32;3], p1: [f32;3]| {
-        let base = positions.len() as u32;
-        positions.push(p0);
-        positions.push(p1);
-        // degenerate triangle (A, B, A): zero area, yields edge (A,B)
-        indices.extend_from_slice(&[base, base+1, base]);
-    };
-
-    // Outer box
-    for &(a,b) in &outer_edges {
-        push_edge(pts[a], pts[b]);
-    }
-
-    // Internal cell-boundary dividers
-    let nx = extent[0] as usize;
-    let ny = extent[1] as usize;
-    let nz = extent[2] as usize;
-
-    // x-dividers (rectangles in yz plane at each internal x boundary)
-    for i in 1..nx {
-        let x = -sx + 2.0 * sx * i as f32 / nx as f32;
-        push_edge([x, -sy, -sz], [x,  sy, -sz]);
-        push_edge([x,  sy, -sz], [x,  sy,  sz]);
-        push_edge([x,  sy,  sz], [x, -sy,  sz]);
-        push_edge([x, -sy,  sz], [x, -sy, -sz]);
-    }
-
-    // y-dividers (rectangles in xz plane)
-    for j in 1..ny {
-        let y = -sy + 2.0 * sy * j as f32 / ny as f32;
-        push_edge([-sx, y, -sz], [ sx, y, -sz]);
-        push_edge([ sx, y, -sz], [ sx, y,  sz]);
-        push_edge([ sx, y,  sz], [-sx, y,  sz]);
-        push_edge([-sx, y,  sz], [-sx, y, -sz]);
-    }
-
-    // z-dividers (rectangles in xy plane)
-    for k in 1..nz {
-        let z = -sz + 2.0 * sz * k as f32 / nz as f32;
-        push_edge([-sx, -sy, z], [ sx, -sy, z]);
-        push_edge([ sx, -sy, z], [ sx,  sy, z]);
-        push_edge([ sx,  sy, z], [-sx,  sy, z]);
-        push_edge([-sx,  sy, z], [-sx, -sy, z]);
-    }
-    wireframe_mesh_from_segments("box-wireframe", positions, indices)
-}
-
-/// Build a wireframe mesh of the sphere r (latitude/longitude lines).
-/// Each segment is a degenerate triangle (A,B,A).
-fn build_sphere_wireframe(r: f32, n_lat: usize, n_lon: usize) -> Mesh {
-    let mut positions = Vec::new();
-    let mut indices = Vec::new();
-    let push_seg = |positions: &mut Vec<[f32;3]>, indices: &mut Vec<u32>, p0: [f32;3], p1: [f32;3]| {
-        let base = positions.len() as u32;
-        positions.push(p0);
-        positions.push(p1);
-        indices.extend_from_slice(&[base, base+1, base]);
-    };
-    // Meridians (fixed azimuth, vary polar angle)
-    for i in 0..n_lon {
-        let az = (i as f32) / (n_lon as f32) * std::f32::consts::TAU;
-        let ca = az.cos(); let sa = az.sin();
-        for j in 0..(2*n_lat) {
-            let t0 = (j as f32) / ((2*n_lat) as f32) * std::f32::consts::PI;
-            let t1 = ((j+1) as f32) / ((2*n_lat) as f32) * std::f32::consts::PI;
-            push_seg(&mut positions, &mut indices,
-                [r*t0.sin()*ca, r*t0.cos(), r*t0.sin()*sa],
-                [r*t1.sin()*ca, r*t1.cos(), r*t1.sin()*sa]);
-        }
-    }
-    // Parallels (fixed polar angle, vary azimuth)
-    for j in 1..n_lat {
-        let pol = (j as f32) / (n_lat as f32) * std::f32::consts::PI;
-        let y = r * pol.cos();
-        let rr = r * pol.sin();
-        for i in 0..(2*n_lat) {
-            let a0 = (i as f32) / ((2*n_lat) as f32) * std::f32::consts::TAU;
-            let a1 = ((i+1) as f32) / ((2*n_lat) as f32) * std::f32::consts::TAU;
-            push_seg(&mut positions, &mut indices,
-                [rr*a0.cos(), y, rr*a0.sin()],
-                [rr*a1.cos(), y, rr*a1.sin()]);
-        }
-    }
-    wireframe_mesh_from_segments("sphere-wireframe", positions, indices)
-}
-
-/// Construct a Mesh of degenerate triangles directly, bypassing the
-/// `dedup_vertices` / `fix_winding` pipeline used by
-/// `Mesh::from_triangles_open`.  Those passes drop zero-area triangles
-/// (which is exactly what every segment (A,B,A) is), erasing the entire
-/// wireframe.  We keep all vertices and indices verbatim.
-fn wireframe_mesh_from_segments(
-    name: &str,
-    positions: Vec<[f32;3]>,
-    indices: Vec<u32>,
-) -> Mesh {
-    use engvis_core::mesh::SubMesh;
-    let mut aabb = engvis_core::aabb::Aabb::empty();
-    for p in &positions {
-        aabb.expand(glam::Vec3::from(*p));
-    }
-    let vertices: Vec<MeshVertex> = positions.into_iter().map(|p| MeshVertex {
-        position: p,
-        normal: [0.0, 1.0, 0.0],
-        uv: [0.0, 0.0],
-        tangent: [1.0, 0.0, 0.0, 1.0],
-    }).collect();
-    let index_count = indices.len() as u32;
-    Mesh {
-        name: name.to_string(),
-        vertices,
-        indices,
-        sub_meshes: vec![SubMesh { material_index: 0, index_offset: 0, index_count }],
-        aabb,
-    }
-}
-
-/// Clip a mesh to the interior of a ball (center `c`, radius `r`) by
-/// **exact spherical cutting**: each triangle straddling the sphere is
-/// split at the exact sphere-edge intersection points, so the resulting
-/// boundary vertices lie on the sphere and the boundary is a discrete
-/// approximation of the curve (sphere) ∩ (surface).
-///
-/// Cases per triangle (d_i = |V_i-c|² - r², inside ⇔ d_i ≤ 0):
-///   • 3 inside : keep
-///   • 0 inside : discard
-///   • 1 inside : split into 1 triangle (V_in, A, B)
-///   • 2 inside : split into 2 triangles (V_next, V_prev, A) + (V_next, A, B)
-/// where A,B are sphere-edge intersection points.  Winding is preserved
-/// from the original triangle.  New vertices get zero normals; the caller
-/// should re-run `overwrite_normals_with_gradient` to fix them.
-fn clip_mesh_to_ball(mesh: &mut Mesh, c: [f32; 3], r: f32) {
-    let r2 = r * r;
-    let d2 = |p: [f32; 3]| -> f32 {
-        let dx = p[0] - c[0];
-        let dy = p[1] - c[1];
-        let dz = p[2] - c[2];
-        dx * dx + dy * dy + dz * dz - r2
-    };
-    // Sphere-edge intersection: t = dA / (dA - dB), P = A + t*(B-A).
-    // Valid when dA, dB have opposite signs (one inside, one outside).
-    let hit = |a: [f32; 3], b: [f32; 3], da: f32, db: f32| -> [f32; 3] {
-        let t = da / (da - db);
-        [a[0] + t * (b[0] - a[0]),
-         a[1] + t * (b[1] - a[1]),
-         a[2] + t * (b[2] - a[2])]
-    };
-
-    // Nested helpers avoid closure borrow conflicts over new_pos/vert_map.
-    fn add_orig(
-        positions: &[[f32; 3]],
-        new_pos: &mut Vec<[f32; 3]>,
-        vert_map: &mut [u32],
-        i: usize,
-    ) -> u32 {
-        if vert_map[i] == u32::MAX {
-            let ni = new_pos.len() as u32;
-            new_pos.push(positions[i]);
-            vert_map[i] = ni;
-        }
-        vert_map[i]
-    }
-    fn add_new(new_pos: &mut Vec<[f32; 3]>, p: [f32; 3]) -> u32 {
-        let ni = new_pos.len() as u32;
-        new_pos.push(p);
-        ni
-    }
-
-    let positions: Vec<[f32; 3]> = mesh.vertices.iter().map(|v| v.position).collect();
-    let mut new_pos: Vec<[f32; 3]> = Vec::with_capacity(positions.len());
-    let mut new_idx: Vec<u32> = Vec::with_capacity(mesh.indices.len());
-    let mut vert_map: Vec<u32> = vec![u32::MAX; positions.len()];
-
-    for tri in mesh.indices.chunks_exact(3) {
-        let i = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
-        let v = [positions[i[0]], positions[i[1]], positions[i[2]]];
-        let d = [d2(v[0]), d2(v[1]), d2(v[2])];
-        let inside = [d[0] <= 0.0, d[1] <= 0.0, d[2] <= 0.0];
-        let n_in = inside.iter().filter(|&&x| x).count();
-
-        match n_in {
-            3 => {
-                let a = add_orig(&positions, &mut new_pos, &mut vert_map, i[0]);
-                let b = add_orig(&positions, &mut new_pos, &mut vert_map, i[1]);
-                let cc = add_orig(&positions, &mut new_pos, &mut vert_map, i[2]);
-                new_idx.extend_from_slice(&[a, b, cc]);
-            }
-            0 => { /* fully outside: discard */ }
-            1 => {
-                // Single inside vertex i0; two outside o1=(i0+1)%3, o2=(i0+2)%3.
-                let i0 = inside.iter().position(|&x| x).unwrap();
-                let o1 = (i0 + 1) % 3;
-                let o2 = (i0 + 2) % 3;
-                let a = hit(v[i0], v[o1], d[i0], d[o1]);
-                let b = hit(v[i0], v[o2], d[i0], d[o2]);
-                let ia = add_orig(&positions, &mut new_pos, &mut vert_map, i[i0]);
-                let iaa = add_new(&mut new_pos, a);
-                let ibb = add_new(&mut new_pos, b);
-                new_idx.extend_from_slice(&[ia, iaa, ibb]);
-            }
-            2 => {
-                // Single outside vertex o; prev=(o+2)%3, next=(o+1)%3 inside.
-                let o = inside.iter().position(|&x| !x).unwrap();
-                let prev = (o + 2) % 3;
-                let next = (o + 1) % 3;
-                let a = hit(v[prev], v[o], d[prev], d[o]); // edge prev-o
-                let b = hit(v[next], v[o], d[next], d[o]); // edge next-o
-                let inext = add_orig(&positions, &mut new_pos, &mut vert_map, i[next]);
-                let iprev = add_orig(&positions, &mut new_pos, &mut vert_map, i[prev]);
-                let iaa = add_new(&mut new_pos, a);
-                let ibb = add_new(&mut new_pos, b);
-                // Quad (next, prev, A, B) → two triangles, winding preserved.
-                new_idx.extend_from_slice(&[inext, iprev, iaa]);
-                new_idx.extend_from_slice(&[inext, iaa, ibb]);
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    // Rebuild vertices (normals zeroed; caller re-runs overwrite_normals_with_gradient).
-    // tangent must be non-zero (e.g. [1,0,0,1]); a zero tangent makes
-    // `normalize(world_tangent)` NaN in the shader, which propagates
-    // through the TBN matrix and turns the fragment black.
-    let mut new_verts: Vec<MeshVertex> = Vec::with_capacity(new_pos.len());
-    for &p in &new_pos {
-        new_verts.push(MeshVertex {
-            position: p,
-            normal: [0.0, 0.0, 0.0],
-            uv: [0.0, 0.0],
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        });
-    }
-    mesh.vertices = new_verts;
-    mesh.indices = new_idx;
-    mesh.sub_meshes.clear();
-    mesh.sub_meshes.push(SubMesh {
-        material_index: 0,
-        index_offset: 0,
-        index_count: mesh.indices.len() as u32,
-    });
-    // Recompute AABB.
-    mesh.aabb = Aabb::empty();
-    for v in &mesh.vertices {
-        mesh.aabb.min[0] = mesh.aabb.min[0].min(v.position[0]);
-        mesh.aabb.min[1] = mesh.aabb.min[1].min(v.position[1]);
-        mesh.aabb.min[2] = mesh.aabb.min[2].min(v.position[2]);
-        mesh.aabb.max[0] = mesh.aabb.max[0].max(v.position[0]);
-        mesh.aabb.max[1] = mesh.aabb.max[1].max(v.position[1]);
-        mesh.aabb.max[2] = mesh.aabb.max[2].max(v.position[2]);
-    }
-}
-
-/// Build a TPMS shell mesh: the thin solid wall `{ |f| ≤ half_t }`.
-///
-/// The shell is a thin band straddling the minimal surface `f = 0`,
-/// bounded by two iso-surfaces `f = ±half_t`.  Its solid region is
-/// described by the **smooth** field `g = f² − half_t²`, which is
-/// negative *inside* the wall and positive outside.  Unlike
-/// `|f| − half_t`, `f²` has no C¹ cusp at `f = 0`, so standard
-/// Marching Cubes stitches adjacent cells without fragmentation —
-/// provided the cell size is smaller than the wall thickness.
-///
-/// The field is CSG-intersected with the unit-box solid so MC
-/// generates cap faces on `x/y/z = ±c`, yielding a watertight wall.
-fn build_shell_mesh(
-    tree: fidget_core::context::Tree,
-    half_t: f32,
-    name: &str,
-    res: usize,
-    clip_to_unit_ball: bool,
-    clip_radius: f32,
-    domain_extent: [f32; 3],
-) -> (Mesh, String) {
-    use fidget_core::context::Tree as T;
-
-    let [sx, sy, sz] = domain_extent;
-    // Padding for MC to detect sign changes at box faces.
-    let pad = 4.0 / res as f32;
-    let mc_extent = [sx + pad, sy + pad, sz + pad];
-    let max_extent = sx.max(sy).max(sz).max(1.0);
-    let half = max_extent + pad;
-    let cell = 2.0 * half / (res as f32 * half).ceil();
-    let (cx, cy, cz) = (sx - 0.5 * cell, sy - 0.5 * cell, sz - 0.5 * cell);
-    let box_sdf = (T::x().abs() - cx).max(T::y().abs() - cy).max(T::z().abs() - cz);
-
-    // Thin-wall solid: g = f² − half_t² (smooth, no cusp), then
-    // CSG-intersect with the box.
-    let wall = tree.square() - half_t * half_t;
-    let field = wall.max(box_sdf);
-    let (mut mesh, mc33_stats) = build_mc33_mesh_domain(field, name, res, mc_extent);
-
-    if clip_to_unit_ball {
-        clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], clip_radius);
-        let clip_msg = format!(" | clip({}v/{}t)", mesh.vertices.len(), mesh.indices.len() / 3);
-        recompute_smooth_normals(&mut mesh);
-        (mesh, format!("{mc33_stats}{clip_msg}"))
-    } else {
-        (mesh, mc33_stats)
-    }
-}
-fn build_mesh(
-    tree: fidget_core::context::Tree,
-    name: &str,
-    backend: MeshBackend,
-    depth: u8,
-    mc_res: usize,
-    clip_to_unit_ball: bool,
-    clip_radius: f32,
-    morphology: Morphology,
-    domain_extent: [f32; 3],
-) -> (Mesh, String) {
-    let [sx, sy, sz] = domain_extent;
-    let max_extent = sx.max(sy).max(sz).max(1.0);
-    let pad = 4.0 / mc_res as f32;
-
-    let is_solid = matches!(morphology, Morphology::Skeletal);
-    let (mut mesh, gen_stats) = if is_solid {
-        use fidget_core::context::Tree as T;
-        let half = max_extent + pad;
-        let cell = 2.0 * half / (mc_res as f32 * half).ceil();
-        let (cx, cy, cz) = (sx - 0.5 * cell, sy - 0.5 * cell, sz - 0.5 * cell);
-        let box_sdf = (T::x().abs() - cx).max(T::y().abs() - cy).max(T::z().abs() - cz);
-        let clipped = tree.clone().max(box_sdf);
-        let mc_extent = [sx + pad, sy + pad, sz + pad];
-        match backend {
-            MeshBackend::DualContouring => build_dc_mesh(clipped, name, depth),
-            MeshBackend::MarchingCubes33 =>
-                build_mc33_mesh_domain(clipped, name, mc_res, mc_extent),
-        }
-    } else {
-        // Minimal surface: expand domain when multiple cells.
-        let mc_extent = [sx + pad, sy + pad, sz + pad];
-        match backend {
-            MeshBackend::DualContouring => build_dc_mesh(tree.clone(), name, depth),
-            MeshBackend::MarchingCubes33 =>
-                build_mc33_mesh_domain(tree.clone(), name, mc_res, mc_extent),
-        }
-    };
-    if clip_to_unit_ball {
-        clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], clip_radius);
-        let clip_msg = format!(" | clip({}v/{}t)", mesh.vertices.len(), mesh.indices.len() / 3);
-        recompute_smooth_normals(&mut mesh);
-        (mesh, format!("{gen_stats}{clip_msg}"))
-    } else {
-        (mesh, gen_stats)
-    }
-}
-
-// =====================================================================
-// 3. Box-face helpers and Marching Squares (for MS-loop visualization)
-// =====================================================================
-
-#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
-enum Face { Xp, Xm, Yp, Ym, Zp, Zm }
-
-impl Face {
-    fn lock(self) -> (usize, f32) {
-        match self {
-            Face::Xp => (0,  1.0),  Face::Xm => (0, -1.0),
-            Face::Yp => (1,  1.0),  Face::Ym => (1, -1.0),
-            Face::Zp => (2,  1.0),  Face::Zm => (2, -1.0),
-        }
-    }
-    fn free_axes(self) -> (usize, usize) {
-        match self {
-            Face::Xp | Face::Xm => (1, 2),
-            Face::Yp | Face::Ym => (0, 2),
-            Face::Zp | Face::Zm => (0, 1),
-        }
-    }
-    fn eval_uv<F: fidget_core::eval::Function + Clone>(
-        &self, shape: &fidget_core::shape::Shape<F, ()>, u: f32, v: f32,
-    ) -> f32 {
-        let (ax, sign) = self.lock();
-        let (ua, va) = self.free_axes();
-        let mut p = [0.0_f32; 3];
-        p[ax] = sign; p[ua] = u; p[va] = v;
-        let mut eval = fidget_core::shape::Shape::<F>::new_float_slice_eval();
-        let tape = shape.float_slice_tape(Default::default());
-        let xs = [p[0]];
-        let ys = [p[1]];
-        let zs = [p[2]];
-        match eval.eval(&tape, &xs, &ys, &zs) {
-            Ok(r) => r[0],
-            Err(_) => 1e9,
-        }
-    }
-}
-
-fn marching_squares_face<F: fidget_core::eval::Function + Clone>(
-    face: Face, shape: &fidget_core::shape::Shape<F, ()>, res: usize,
-) -> Vec<([f32; 2], [f32; 2])> {
-    let step = 2.0 / res as f32;
-    let mut grid: Vec<Vec<f32>> = Vec::with_capacity(res + 1);
-    for j in 0..=res {
-        let mut row = Vec::with_capacity(res + 1);
-        for i in 0..=res {
-            let u = -1.0 + i as f32 * step;
-            let v = -1.0 + j as f32 * step;
-            row.push(face.eval_uv(shape, u, v));
-        }
-        grid.push(row);
-    }
-    let mut segs: Vec<([f32; 2], [f32; 2])> = Vec::new();
-    for j in 0..res {
-        for i in 0..res {
-            let tl = grid[j][i];   let tr = grid[j][i+1];
-            let bl = grid[j+1][i]; let br = grid[j+1][i+1];
-            let case = ((if tl < 0.0 {1}else{0})
-                      | (if tr < 0.0 {2}else{0})
-                      | (if br < 0.0 {4}else{0})
-                      | (if bl < 0.0 {8}else{0})) as u8;
-            if case == 0 || case == 15 { continue; }
-            let lerp_a = |a: f32, b: f32| {
-                let d = b - a;
-                if d.abs() < 1e-12 { 0.5 } else { -a / d }
-            };
-            let top    = [-1.0+(i as f32+lerp_a(tl,tr))*step, -1.0+j as f32*step];
-            let bottom = [-1.0+(i as f32+lerp_a(bl,br))*step, -1.0+(j+1) as f32*step];
-            let left   = [-1.0+i as f32*step, -1.0+(j as f32+lerp_a(tl,bl))*step];
-            let right  = [-1.0+(i+1) as f32*step, -1.0+(j as f32+lerp_a(tr,br))*step];
-            match case {
-                1|14  => { segs.push((left,  bottom)); }
-                2|13  => { segs.push((bottom,right )); }
-                3|12  => { segs.push((left,  right )); }
-                4|11  => { segs.push((top,   right )); }
-                5     => { segs.push((left,top)); segs.push((bottom,right)); }
-                6|9   => { segs.push((top,bottom)); }
-                7|8   => { segs.push((left,right)); }
-                10    => { segs.push((top,left)); segs.push((bottom,right)); }
-                _ => {}
-            }
-        }
-    }
-    segs
-}
-
-fn dist3_2(a:[f32;3],b:[f32;3])->f32{
-    (a[0]-b[0]).powi(2)+(a[1]-b[1]).powi(2)+(a[2]-b[2]).powi(2)
-}
-
-/// Extract 3D boundary loops (f=0) on all 6 box faces via Marching Squares.
-fn extract_ms_loops_3d<F:fidget_core::eval::Function+Clone>(
-    shape:&fidget_core::shape::Shape<F,()>, res:usize,
-)->Vec<Vec<[f32;3]>>{
-    let mut all_segs:Vec<([f32;3],[f32;3])>=Vec::new();
-    for face in [Face::Xp,Face::Xm,Face::Yp,Face::Ym,Face::Zp,Face::Zm]{
-        let segs_2d=marching_squares_face(face,shape,res);
-        let (ax,sign)=face.lock();
-        let (ua,va)=face.free_axes();
-        for &(a,b) in &segs_2d{
-            let to3d=|p:[f32;2]|{
-                let mut q=[0.0_f32;3];
-                q[ax]=sign; q[ua]=p[0]; q[va]=p[1];
-                q
-            };
-            all_segs.push((to3d(a),to3d(b)));
-        }
-    }
-    // Chain segments into closed loops.
-    let mut loops:Vec<Vec<[f32;3]>>=Vec::new();
-    let mut rem=all_segs.clone();
-    while !rem.is_empty(){
-        let mut lp=vec![rem[0].0,rem[0].1];
-        rem.remove(0);
-        for _ in 0..100000{
-            let last=*lp.last().unwrap();
-            let mut found:Option<(usize,bool)>=None;
-            for (si,&(a,b)) in rem.iter().enumerate(){
-                if dist3_2(a,last)<1e-4{found=Some((si,true));break;}
-                if dist3_2(b,last)<1e-4{found=Some((si,false));break;}
-            }
-            match found{
-                Some((si,fwd))=>{
-                    let (a,b)=rem.remove(si);
-                    lp.push(if fwd{b}else{a});
-                }
-                None=>break,
-            }
-        }
-        if lp.len()>=3 && dist3_2(lp[0],*lp.last().unwrap())<1e-4{
-            lp.pop();
-        }
-        if lp.len()>=3{loops.push(lp);}
-    }
-    loops
-}
-
-/// Build a thin triangle strip mesh representing MS boundary loops.
-fn build_ms_loops_mesh<F:fidget_core::eval::Function+Clone>(
-    shape:&fidget_core::shape::Shape<F,()>, res:usize,
-)->Mesh{
-    let loops=extract_ms_loops_3d(shape,res);
-    let mut positions:Vec<[f32;3]>=Vec::new();
-    let mut indices:Vec<u32>=Vec::new();
-    let half_w=0.008_f32;
-    for lp in &loops{
-        let n=lp.len();
-        if n<2{continue;}
-        for i in 0..n{
-            let p0=lp[i];
-            let p1=lp[(i+1)%n];
-            let dir=[p1[0]-p0[0],p1[1]-p0[1],p1[2]-p0[2]];
-            let len=(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]).sqrt();
-            if len<1e-10{continue;}
-            let dn=[dir[0]/len,dir[1]/len,dir[2]/len];
-            let axis=if dn[0].abs()<dn[1].abs()&&dn[0].abs()<dn[2].abs(){[1.0_f32,0.0,0.0]}
-                     else if dn[1].abs()<dn[2].abs(){[0.0,1.0,0.0]}
-                     else{[0.0,0.0,1.0]};
-            let perp=[
-                dn[1]*axis[2]-dn[2]*axis[1],
-                dn[2]*axis[0]-dn[0]*axis[2],
-                dn[0]*axis[1]-dn[1]*axis[0],
-            ];
-            let pl=(perp[0]*perp[0]+perp[1]*perp[1]+perp[2]*perp[2]).sqrt();
-            let perp=if pl>1e-10{[perp[0]/pl*half_w,perp[1]/pl*half_w,perp[2]/pl*half_w]}else{[half_w,0.0,0.0]};
-            let base=positions.len() as u32;
-            positions.push([p0[0]+perp[0],p0[1]+perp[1],p0[2]+perp[2]]);
-            positions.push([p0[0]-perp[0],p0[1]-perp[1],p0[2]-perp[2]]);
-            positions.push([p1[0]+perp[0],p1[1]+perp[1],p1[2]+perp[2]]);
-            positions.push([p1[0]-perp[0],p1[1]-perp[1],p1[2]-perp[2]]);
-            indices.extend_from_slice(&[base,base+1,base+2, base+1,base+3,base+2]);
-        }
-    }
-    eprintln!("  [MS-loops] {} loops, {} verts, {} tris",
-              loops.len(),positions.len(),indices.len()/3);
-    let mut mesh=Mesh::from_triangles_open("ms-loops",&positions,&indices);
-    for v in &mut mesh.vertices{ v.normal=[0.0,1.0,0.0]; }
-    mesh
-}
-
-// =====================================================================
-// 4. Boundary smoothing: move DC boundary vertices onto curve C
-// =====================================================================
-
-fn smooth_boundary_ms<F:fidget_core::eval::Function+Clone>(
-    shape:&fidget_core::shape::Shape<F,()>,
-    positions:&mut Vec<[f32;3]>, indices:&mut Vec<u32>,
-){
-    use std::collections::{HashMap,HashSet};
-
-    // Identify DC boundary edges (edges belonging to exactly one triangle).
-    let mut edge_cnt:HashMap<(u32,u32),u32>=HashMap::new();
-    for tri in indices.chunks_exact(3){
-        let (a,b,c)=(tri[0],tri[1],tri[2]);
-        for &(i0,i1) in &[(a,b),(b,c),(c,a)]{
-            let key=if i0<=i1{(i0,i1)}else{(i1,i0)};
-            *edge_cnt.entry(key).or_default()+=1;
-        }
-    }
-    let mut bnd_verts:HashSet<u32>=HashSet::new();
-    for (&(a,b),&cnt) in &edge_cnt{
-        if cnt==1{
-            bnd_verts.insert(a);
-            bnd_verts.insert(b);
-        }
-    }
-    if bnd_verts.is_empty(){return;}
-
-    // Project a 3D point onto curve C = (box face) ∩ {f=0}.
-    // Only project if the point is close to a box face (|coord| > 0.9).
-    let project_to_c=|p:[f32;3]|->Option<[f32;3]>{
-        let ax=[p[0].abs(),p[1].abs(),p[2].abs()];
-        let max_ax=ax.iter().cloned().fold(0.0_f32, f32::max);
-        if max_ax < 0.9 { return None; }
-
-        let lock_ax=if ax[0]>=ax[1]&&ax[0]>=ax[2]{0}
-                    else if ax[1]>=ax[2]{1}else{2};
-        let sign=if p[lock_ax]>=0.0{1.0_f32}else{-1.0};
-        let face=match (lock_ax,sign){
-            (0, 1.0)=>Face::Xp,(0,-1.0)=>Face::Xm,
-            (1, 1.0)=>Face::Yp,(1,-1.0)=>Face::Ym,
-            (2, 1.0)=>Face::Zp,(2,-1.0)=>Face::Zm,
-            _=>return None,
-        };
-        let (ua,va)=face.free_axes();
-        let mut u=p[ua]; let mut v=p[va];
-        for _ in 0..24{
-            let fval=face.eval_uv(shape,u,v);
-            if fval.abs()<1e-8{break;}
-            let eps=1e-6;
-            let gx=(face.eval_uv(shape,u+eps,v)-fval)/eps;
-            let gy=(face.eval_uv(shape,u,v+eps)-fval)/eps;
-            let m=gx*gx+gy*gy;
-            if m<1e-20{break;}
-            let s=fval/m;
-            u-=s*gx; v-=s*gy;
-        }
-        let mut q=[0.0_f32;3]; q[lock_ax]=sign; q[ua]=u; q[va]=v;
-        Some(q)
-    };
-
-    // Move each boundary vertex onto curve C.
-    let mut moved=0u32;
-    for &vi in &bnd_verts{
-        let p=positions[vi as usize];
-        if let Some(pc)=project_to_c(p){
-            positions[vi as usize]=pc;
-            moved+=1;
-        }
-    }
-    eprintln!("  smooth_boundary_ms: moved {} / {} boundary vertices to curve C",
-              moved, bnd_verts.len());
-}
-
-/// Overwrite per-vertex normals with the analytic surface gradient ∇f.
-fn overwrite_normals_with_gradient<F:fidget_core::eval::Function+Clone>(
-    shape: &fidget_core::shape::Shape<F, ()>, mesh: &mut Mesh,
+/// 渲染 GradientField 的 UI 控件（mode 下拉 + 参数滑块）。
+fn gradient_field_ui(
+    ui: &mut egui::Ui,
+    g: &mut GradientField,
+    needs_remesh: &mut bool,
+    id_salt: &str,
 ) {
-    use fidget_core::types::Grad;
-    let mut grad_eval = fidget_core::shape::Shape::<F>::new_grad_slice_eval();
-    let tape = shape.grad_slice_tape(Default::default());
-    let n = mesh.vertices.len();
-    let chunk = 4096;
-    for start in (0..n).step_by(chunk) {
-        let end = (start + chunk).min(n);
-        let xs: Vec<Grad> = mesh.vertices[start..end].iter().map(|v| Grad::from(v.position[0])).collect();
-        let ys: Vec<Grad> = mesh.vertices[start..end].iter().map(|v| Grad::from(v.position[1])).collect();
-        let zs: Vec<Grad> = mesh.vertices[start..end].iter().map(|v| Grad::from(v.position[2])).collect();
-        let res = match grad_eval.eval(&tape, &xs, &ys, &zs) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for (i, g) in res.iter().enumerate() {
-            let len = (g.dx*g.dx + g.dy*g.dy + g.dz*g.dz).sqrt();
-            if len > 1e-10 {
-                let inv = 1.0 / len;
-                mesh.vertices[start + i].normal = [g.dx*inv, g.dy*inv, g.dz*inv];
+    let mode_id = egui::Id::new(("grad_mode", id_salt));
+    egui::ComboBox::from_id_salt(mode_id)
+        .selected_text(match g.mode {
+            GradientMode::None => "None",
+            GradientMode::Linear => "Linear",
+            GradientMode::Sigmoid => "Sigmoid",
+            GradientMode::BoundaryDecay => "BoundaryDecay",
+        })
+        .show_ui(ui, |ui| {
+            for (m, label) in [
+                (GradientMode::None, "None"),
+                (GradientMode::Linear, "Linear"),
+                (GradientMode::Sigmoid, "Sigmoid"),
+                (GradientMode::BoundaryDecay, "BoundaryDecay"),
+            ] {
+                if ui.selectable_label(g.mode == m, label).clicked() {
+                    g.mode = m;
+                    *needs_remesh = true;
+                }
             }
-        }
+        });
+    if matches!(g.mode, GradientMode::None) {
+        return;
     }
+    egui::Grid::new(("grad_grid", id_salt))
+        .num_columns(2).spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Axis x");
+            if ui.add(egui::Slider::new(&mut g.axis[0], -1.0..=1.0).text("")).changed() {
+                *needs_remesh = true;
+            }
+            ui.end_row();
+            ui.label("Axis y");
+            if ui.add(egui::Slider::new(&mut g.axis[1], -1.0..=1.0).text("")).changed() {
+                *needs_remesh = true;
+            }
+            ui.end_row();
+            ui.label("Axis z");
+            if ui.add(egui::Slider::new(&mut g.axis[2], -1.0..=1.0).text("")).changed() {
+                *needs_remesh = true;
+            }
+            ui.end_row();
+            ui.label("Base");
+            if ui.add(egui::Slider::new(&mut g.base, -2.0..=2.0).text("")).changed() {
+                *needs_remesh = true;
+            }
+            ui.end_row();
+            ui.label("Delta");
+            if ui.add(egui::Slider::new(&mut g.delta, -2.0..=2.0).text("")).changed() {
+                *needs_remesh = true;
+            }
+            ui.end_row();
+            let center_label = match g.mode {
+                GradientMode::Linear => "Span",
+                GradientMode::Sigmoid => "Center x0",
+                GradientMode::BoundaryDecay => "Radius R",
+                GradientMode::None => "Center",
+            };
+            ui.label(center_label);
+            if ui.add(egui::Slider::new(&mut g.center, 0.01..=3.0).text("")).changed() {
+                *needs_remesh = true;
+            }
+            ui.end_row();
+            if matches!(g.mode, GradientMode::Sigmoid | GradientMode::BoundaryDecay) {
+                ui.label("Sharpness");
+                if ui.add(egui::Slider::new(&mut g.sharpness, 0.1..=20.0).text("")).changed() {
+                    *needs_remesh = true;
+                }
+                ui.end_row();
+            }
+        });
 }
 
-/// Smart normal assignment with vertex splitting for CSG-intersected meshes.
-///
-/// The composite field `g = max(f, box_sdf)` has a C¹-discontinuity at the
+// =====================================================================
 // 5. App
 // =====================================================================
 
-/// Source of the implicit expression: a built-in name, or a user-typed
-/// Rhai script (compiled by `fidget-rhai`).
-#[derive(Clone, PartialEq, Eq)]
-enum SurfaceSource {
-    BuiltIn(&'static str),
-    Custom, // Rhai expression in `App::custom_expr`
+/// Tabs shown in the right panel.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Tab {
+    Surface, // TPMS type + formula + primitives + custom expr
+    Cell,    // period, cells, Lx/Ly/Lz, amplitude, offset C
+    Deform,  // rotation, blend, gradient fields
+    Morph,   // minimal/shell/skeletal + params
+    Mesh,    // backend + simplification
+    Display, // visual settings
+    Topo,    // topology stats
 }
-
-/// Workflow steps shown in the left "trait"-style panel.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Step { Source, Mesh, Display, Topology }
-
-const PRIMITIVE_SURFACES: &[(&str, &str)] = &[
-    ("sphere", "Sphere"),
-    ("torus",  "Torus"),
-];
-
-const TPMS_SURFACES: &[(&str, &str)] = &[
-    ("gyroid",        "Gyroid"),
-    ("schwarz-p",     "Schwarz P"),
-    ("schwarz-d",     "Schwarz D"),
-    ("schoen-iwp",    "Schoen IWP"),
-    ("neovius",       "Neovius"),
-    ("f-rd",          "F-RD (Schoen FRD)"),
-    ("lidinoid",      "Lidinoid"),
-    ("split-p",       "Split-P"),
-    ("fischer-koch-s", "Fischer-Koch S"),
-    ("fischer-koch-y", "Fischer-Koch Y"),
-    ("fischer-koch-cp","Fischer-Koch CP"),
-];
 
 /// 二分查找 C 值使 vol_frac(C) = target_phi。
 ///
@@ -1220,9 +176,7 @@ fn solve_c_for_vol_frac(
 
 struct App {
     // ── implicit surface source ──
-    source: SurfaceSource,
-    /// The name currently shown in the TPMS combo-box.
-    selected_tpms: &'static str,
+    source: SurfaceType,
     custom_expr: String,
     custom_error: Option<String>,
     clip_to_unit_ball: bool,
@@ -1242,6 +196,28 @@ struct App {
     /// 缓存的 C 值（由 tpms_vol_frac 求解得到），用于 UI 显示。
     /// 在 remesh 时更新；初始值 0.0。
     cached_c_value: f32,
+    /// 三轴单胞边长 [Lx, Ly, Lz]，默认 [1,1,1]。
+    tpms_cell_size: [f32; 3],
+    /// 三轴幅值缩放系数 [a, b, c]，默认 [1,1,1]。
+    tpms_amplitude: [f32; 3],
+    /// 全局等值面偏移 C，默认 0（高级模式）。
+    tpms_offset: f32,
+    /// 旋转轴（单位向量），用于全局单胞旋转。
+    rotation_axis: [f32; 3],
+    /// 旋转角（度数，UI 友好；构造 Tree 时转弧度）。
+    rotation_angle_deg: f32,
+    /// 双 TPMS 混合：副曲面名（None 表示禁用）。
+    blend_secondary: Option<String>,
+    /// 混合权重空间场（值域被裁剪到 [0,1]）。
+    blend_weight_field: GradientField,
+    /// 过渡方向轴索引：0=x, 1=y, 2=z。
+    blend_axis: u32,
+    /// f1 (Primary) 占据的 cell 范围 [start, end]（沿 blend_axis 方向）。
+    blend_f1_cells: [u32; 2],
+    /// f2 (Secondary) 占据的 cell 范围 [start, end]。
+    blend_f2_cells: [u32; 2],
+    /// 等值面偏移 C 的空间梯度场（None 模式时回落到 tpms_offset 标量）。
+    offset_field: GradientField,
     morphology: Morphology,
 
     // ── meshing ──
@@ -1277,7 +253,7 @@ struct App {
     background_color: [f32; 3],
 
     // ── workflow / UI ──
-    current_step: Step,
+    current_tab: Tab,
 
     // ── load / save ──
     pending_load: Option<std::path::PathBuf>,
@@ -1305,8 +281,7 @@ struct App {
 /// This is sent to a background thread to avoid blocking the UI.
 #[derive(Clone)]
 struct AppBuildSnapshot {
-    source: SurfaceSource,
-    custom_expr: String,
+    source: SurfaceType,
     clip_to_unit_ball: bool,
     clip_radius: f32,
     sphere_radius: f32,
@@ -1318,6 +293,17 @@ struct AppBuildSnapshot {
     /// 体积分数 φ ∈ [0,1]：0.5=对称极小曲面，→0/1=完全填充。
     /// 内部通过二分查找求解对应的 C 值（f = C 的等值面）。
     tpms_vol_frac: f32,
+    /// 三轴单胞边长 [Lx, Ly, Lz]，默认 [1,1,1]。
+    tpms_cell_size: [f32; 3],
+    /// 三轴幅值缩放系数 [a, b, c]，默认 [1,1,1]。
+    tpms_amplitude: [f32; 3],
+    /// 全局等值面偏移 C，默认 0（高级模式）。
+    tpms_offset: f32,
+    rotation_axis: [f32; 3],
+    rotation_angle_deg: f32,
+    blend_secondary: Option<String>,
+    blend_weight_field: GradientField,
+    offset_field: GradientField,
     morphology: Morphology,
     mesh_backend: MeshBackend,
     surf_depth: u8,
@@ -1338,7 +324,6 @@ impl AppBuildSnapshot {
     fn from_app(app: &App) -> Self {
         Self {
             source: app.source.clone(),
-            custom_expr: app.custom_expr.clone(),
             clip_to_unit_ball: app.clip_to_unit_ball,
             clip_radius: app.clip_radius,
             sphere_radius: app.sphere_radius,
@@ -1348,6 +333,14 @@ impl AppBuildSnapshot {
             tpms_cells: app.tpms_cells,
             tpms_thickness: app.tpms_thickness,
             tpms_vol_frac: app.tpms_vol_frac,
+            tpms_cell_size: app.tpms_cell_size,
+            tpms_amplitude: app.tpms_amplitude,
+            tpms_offset: app.tpms_offset,
+            rotation_axis: app.rotation_axis,
+            rotation_angle_deg: app.rotation_angle_deg,
+            blend_secondary: app.blend_secondary.clone(),
+            blend_weight_field: app.blend_weight_field,
+            offset_field: app.offset_field,
             morphology: app.morphology,
             mesh_backend: app.mesh_backend,
             surf_depth: app.surf_depth,
@@ -1366,29 +359,34 @@ impl AppBuildSnapshot {
     }
 
     fn surface_label(&self) -> String {
-        match &self.source {
-            SurfaceSource::BuiltIn(n) => (*n).to_string(),
-            SurfaceSource::Custom => "custom".to_string(),
+        self.source.label().to_string()
+    }
+
+    fn tree_params(&self) -> TreeParams<'_> {
+        TreeParams {
+            name: self.source.name(),
+            sphere_radius: self.sphere_radius,
+            torus_major_r: self.torus_major_r,
+            torus_minor_r: self.torus_minor_r,
+            tpms_period: self.tpms_period,
+            tpms_cell_size: self.tpms_cell_size,
+            tpms_amplitude: self.tpms_amplitude,
+            tpms_offset: self.tpms_offset,
+            tpms_cells: self.tpms_cells,
+            rotation_axis: self.rotation_axis,
+            rotation_angle: self.rotation_angle_deg.to_radians(),
+            blend_secondary: self.blend_secondary.as_deref(),
+            blend_weight_field: self.blend_weight_field,
+            offset_field: self.offset_field,
         }
     }
 
     fn current_tree(&self) -> Result<fidget_core::context::Tree, String> {
-        match &self.source {
-            SurfaceSource::BuiltIn(_) => {
-                let p = TreeParams {
-                    name: match &self.source {
-                        SurfaceSource::BuiltIn(n) => *n,
-                        SurfaceSource::Custom => "custom",
-                    },
-                    sphere_radius: self.sphere_radius,
-                    torus_major_r: self.torus_major_r,
-                    torus_minor_r: self.torus_minor_r,
-                    tpms_period: self.tpms_period,
-                    tpms_cells: self.tpms_cells,
-                };
-                Ok(build_tree(&p))
-            }
-            SurfaceSource::Custom => build_tree_from_rhai(&self.custom_expr),
+        if let SurfaceType::Custom(expr) = &self.source {
+            build_tree_from_rhai(expr)
+        } else {
+            let p = self.tree_params();
+            Ok(build_tree(&p))
         }
     }
 
@@ -1414,11 +412,14 @@ impl AppBuildSnapshot {
 
         let label = self.surface_label();
 
-        let shell_grad = if matches!(&self.source,
-            SurfaceSource::BuiltIn(n) if TPMS_SURFACES.iter().any(|(k,_)| k == n))
-        {
+        let shell_grad = if self.source.is_tpms() {
             // |grad f| ≈ k（单元晶胞内的最大梯度）。
-            self.tpms_period.max(1.0)
+            // 幅值系数放大梯度，取三轴最大值。
+            let k = self.tpms_period.max(1.0);
+            let amp_max = self.tpms_amplitude[0]
+                .max(self.tpms_amplitude[1])
+                .max(self.tpms_amplitude[2]);
+            k * amp_max
         } else {
             1.0
         };
@@ -1448,10 +449,9 @@ impl AppBuildSnapshot {
             }
         };
         let effective_res = {
-            let mut min_feature = match &self.source {
-                SurfaceSource::BuiltIn("torus") => 2.0 * self.torus_minor_r,
-                SurfaceSource::BuiltIn(n)
-                    if TPMS_SURFACES.iter().any(|(k,_)| k == n) => {
+            let mut min_feature = match self.source {
+                SurfaceType::Torus => 2.0 * self.torus_minor_r,
+                _ if self.source.is_tpms() => {
                     // 最小特征尺寸由最高频方向决定（周期 k）。
                     std::f32::consts::PI / self.tpms_period
                 }
@@ -1473,10 +473,12 @@ impl AppBuildSnapshot {
             needed
         };
         // Domain extent: for TPMS, per-axis cell counts; otherwise unit cube.
-        let domain_extent = if matches!(&self.source,
-            SurfaceSource::BuiltIn(n) if TPMS_SURFACES.iter().any(|(k,_)| k == n))
-        {
-            [self.tpms_cells[0] as f32, self.tpms_cells[1] as f32, self.tpms_cells[2] as f32]
+        let domain_extent = if self.source.is_tpms() {
+            [
+                self.tpms_cells[0] as f32 * self.tpms_cell_size[0],
+                self.tpms_cells[1] as f32 * self.tpms_cell_size[1],
+                self.tpms_cells[2] as f32 * self.tpms_cell_size[2],
+            ]
         } else {
             [1.0, 1.0, 1.0]
         };
@@ -1549,10 +551,8 @@ impl AppBuildSnapshot {
         if self.show_bounding {
             let wf_mesh = if self.clip_to_unit_ball {
                 build_sphere_wireframe(self.clip_radius, 12, 24)
-            } else {
-                let extent = if matches!(&self.source,
-                    SurfaceSource::BuiltIn(n) if TPMS_SURFACES.iter().any(|(k,_)| k == n))
-                {
+                } else {
+                let extent = if self.source.is_tpms() {
                     [self.tpms_cells[0] as f32, self.tpms_cells[1] as f32, self.tpms_cells[2] as f32]
                 } else {
                     [1.0, 1.0, 1.0]
@@ -1604,25 +604,7 @@ struct MeshBuildResult {
 
 impl App {
     fn surface_label(&self) -> String {
-        match &self.source {
-            SurfaceSource::BuiltIn(n) => (*n).to_string(),
-            SurfaceSource::Custom => "custom".to_string(),
-        }
-    }
-
-    fn tree_params(&self) -> TreeParams<'_> {
-        let name = match &self.source {
-            SurfaceSource::BuiltIn(n) => *n,
-            SurfaceSource::Custom => "custom",
-        };
-        TreeParams {
-            name,
-            sphere_radius: self.sphere_radius,
-            torus_major_r: self.torus_major_r,
-            torus_minor_r: self.torus_minor_r,
-            tpms_period: self.tpms_period,
-            tpms_cells: self.tpms_cells,
-        }
+        self.source.label().to_string()
     }
 
     /// Build the scene synchronously (used for initial setup and fallback).
@@ -1761,10 +743,10 @@ impl EngvisApp for App {
                     match self.load_external_mesh(&path) {
                         Ok(scene) => {
                             let aabb = scene.meshes.iter().fold(
-                                Aabb::empty(),
-                                |mut a, m| { a.expand(glam::Vec3::from(m.aabb.min));
-                                             a.expand(glam::Vec3::from(m.aabb.max)); a }
-                            );
+                                    Aabb::empty(),
+                                    |mut a, m| { a.expand(glam::Vec3::from(m.aabb.min));
+                                                 a.expand(glam::Vec3::from(m.aabb.max)); a }
+                                );
                             *frame.scene = scene;
                             frame.camera.fit_to_aabb(aabb);
                             *frame.scene_dirty = true;
@@ -1897,38 +879,55 @@ impl EngvisApp for App {
             });
         });
 
-        // ── Left "workflow" panel (numbered, trait-style) ──────────
-        egui::SidePanel::left("workflow")
-            .resizable(true).default_width(180.0)
+        // ── Left "tabs" panel (vertical navigation) ────────────────
+        egui::SidePanel::left("tabs")
+            .resizable(true).default_width(170.0)
             .show(egui_ctx, |ui| {
-                ui.heading("Workflow");
+                ui.heading("engvis");
                 ui.add_space(6.0);
-                let steps = [
-                    (Step::Source,   "1. Source"),
-                    (Step::Mesh,     "2. Mesh"),
-                    (Step::Display,  "3. Display"),
-                    (Step::Topology, "4. Topology"),
+                ui.label(egui::RichText::new("Parameters").strong());
+                ui.add_space(4.0);
+                let tabs = [
+                    (Tab::Surface, "Surface",   "TPMS type & formula"),
+                    (Tab::Cell,    "Cell",      "Period, cells, L, amp"),
+                    (Tab::Deform,  "Deform",    "Rotation, blend, grad"),
+                    (Tab::Morph,   "Morph",     "Shell / skeletal"),
+                    (Tab::Mesh,    "Mesh",      "Backend & simplify"),
+                    (Tab::Display, "Display",   "Colors, PBR, edges"),
+                    (Tab::Topo,    "Topo",      "Euler & manifold"),
                 ];
-                for (s, label) in steps {
-                    if ui.selectable_label(self.current_step == s, label).clicked() {
-                        self.current_step = s;
+                for (t, label, hint) in tabs {
+                    let sel = self.current_tab == t;
+                    let resp = ui.selectable_label(sel, label);
+                    if sel {
+                        ui.indent((t, "hint"), |ui| {
+                            ui.label(egui::RichText::new(hint)
+                                        .small().color(ui.visuals().weak_text_color()));
+                        });
+                    }
+                    if resp.clicked() {
+                        self.current_tab = t;
                     }
                 }
-                ui.add_space(12.0);
-                ui.separator();
-                ui.label("Click a step -> edit details on the right.");
             });
 
         // ── Right "details" panel ──────────────────────────────────
         egui::SidePanel::right("details")
-            .resizable(true).default_width(320.0)
+            .resizable(true).default_width(340.0)
             .show(egui_ctx, |ui| {
-                match self.current_step {
-                    Step::Source    => self.ui_source(ui, egui_ctx),
-                    Step::Mesh      => self.ui_mesh(ui),
-                    Step::Display   => self.ui_display(ui, frame.render_state),
-                    Step::Topology  => self.ui_topology(ui),
-                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        match self.current_tab {
+                            Tab::Surface => self.ui_surface(ui, egui_ctx),
+                            Tab::Cell    => self.ui_cell(ui, egui_ctx),
+                            Tab::Deform  => self.ui_deform(ui, egui_ctx),
+                            Tab::Morph   => self.ui_morph(ui, egui_ctx),
+                            Tab::Mesh    => self.ui_mesh(ui),
+                            Tab::Display => self.ui_display(ui, frame.render_state),
+                            Tab::Topo    => self.ui_topology(ui),
+                        }
+                    });
             });
     }
 
@@ -1940,36 +939,81 @@ impl EngvisApp for App {
 }
 
 impl App {
-    fn ui_source(&mut self, ui: &mut egui::Ui, egui_ctx: &egui::Context) {
-        ui.heading("1. Source");
+    /// True when the active source is a built-in TPMS surface.
+    fn tpms_active(&self) -> bool {
+        self.source.is_tpms()
+    }
+
+    /// 根据 cell 范围自动计算 blend 权重场的 Sigmoid 参数。
+    /// 坐标域为 [-extent, +extent]，其中 extent = cells * L。
+    /// f1_cells = [a, b] 表示 cell a..=b 区域用 f1，
+    /// f2_cells = [c, d] 表示 cell c..=d 区域用 f2，
+    /// 中间自动 Sigmoid 过渡。
+    fn sync_blend_weight_from_cells(&mut self) {
+        let axis_idx = self.blend_axis as usize;
+        let n_cells = self.tpms_cells[axis_idx].max(1);
+        let cell_size = self.tpms_cell_size[axis_idx].max(1e-6);
+        let extent = n_cells as f32 * cell_size;
+
+        // Cell 编号 0-based，映射到坐标空间 [-extent, +extent]
+        // cell i 的中心坐标 = -extent + (i + 0.5) * cell_size
+        let cell_center = |i: u32| -> f32 {
+            -extent + (i as f32 + 0.5) * cell_size
+        };
+
+        let f1_end = (self.blend_f1_cells[1]).min(n_cells - 1);
+        let f2_start = (self.blend_f2_cells[0]).min(n_cells - 1);
+
+        // Sigmoid 中心 = f1 末尾和 f2 开头的中间位置
+        let x0 = (cell_center(f1_end) + cell_center(f2_start)) / 2.0;
+        // Sigmoid 跨度 = 两个区域之间的距离（归一化到 cell_size）
+        let span = (cell_center(f2_start) - cell_center(f1_end)).abs().max(cell_size);
+        // sharpness 使过渡在约 1 个 cell 宽度内完成
+        let sharpness = 4.0 * cell_size / span;
+
+        let mut axis = [0.0f32; 3];
+        axis[axis_idx] = 1.0;
+
+        self.blend_weight_field = GradientField {
+            mode: GradientMode::Sigmoid,
+            axis,
+            base: 0.0,  // w → 0 at f2 side
+            delta: 1.0,  // w → 1 at f1 side
+            sharpness: sharpness.max(0.5).min(20.0),
+            center: x0,
+        };
+        self.needs_remesh = true;
+    }
+
+    fn ui_surface(&mut self, ui: &mut egui::Ui, egui_ctx: &egui::Context) {
+        ui.heading("Surface");
         ui.label("Implicit surface f(x,y,z) = 0.");
         ui.add_space(6.0);
 
         // ── Primitive shapes ──────────────────────────────
         ui.label("Primitive shapes:");
-        for (key, label) in PRIMITIVE_SURFACES {
-            let selected = matches!(&self.source, SurfaceSource::BuiltIn(n) if n == key);
-            if ui.selectable_label(selected, *label).clicked() {
-                self.source = SurfaceSource::BuiltIn(*key);
+        for surface in SurfaceType::primitive_surfaces() {
+            let selected = self.source == surface;
+            if ui.selectable_label(selected, surface.label()).clicked() {
+                self.source = surface.clone();
                 self.needs_remesh = true;
             }
-            // Show parameters directly below the selected primitive
             if selected {
-                ui.indent((*key, "params"), |ui| {
-                    match *key {
-                        "sphere" => {
+                ui.indent((surface.name(), "params"), |ui| {
+                    match self.source {
+                        SurfaceType::Sphere => {
                             if ui.add(egui::Slider::new(&mut self.sphere_radius, 0.1..=3.0)
-                                .text("Radius")).changed() {
+                                            .text("Radius")).changed() {
                                 self.needs_remesh = true;
                             }
                         }
-                        "torus" => {
+                        SurfaceType::Torus => {
                             if ui.add(egui::Slider::new(&mut self.torus_major_r, 0.1..=3.0)
-                                .text("Major R")).changed() {
+                                            .text("Major R")).changed() {
                                 self.needs_remesh = true;
                             }
                             if ui.add(egui::Slider::new(&mut self.torus_minor_r, 0.02..=1.5)
-                                .text("Minor r")).changed() {
+                                            .text("Minor r")).changed() {
                                 self.needs_remesh = true;
                             }
                         }
@@ -1982,45 +1026,38 @@ impl App {
         ui.add_space(10.0);
         // ── TPMS (dropdown) ───────────────────────────────
         ui.label("Triply Periodic Minimal Surfaces:");
-        let prev_idx = TPMS_SURFACES.iter()
-            .position(|(k, _)| *k == self.selected_tpms)
+        let tpms_surfaces = SurfaceType::tpms_surfaces();
+        let current_idx = tpms_surfaces.iter()
+            .position(|s| *s == self.source)
             .unwrap_or(0);
-        let mut tpms_idx = prev_idx;
+        let mut tpms_idx = current_idx;
         egui::ComboBox::from_id_salt("tpms_combo")
             .width(200.0)
-            .selected_text(TPMS_SURFACES[tpms_idx].1)
+            .selected_text(tpms_surfaces[current_idx].label())
             .show_ui(ui, |ui| {
-                for (i, (_key, label)) in TPMS_SURFACES.iter().enumerate() {
-                    ui.selectable_value(&mut tpms_idx, i, *label);
+                for (i, surface) in tpms_surfaces.iter().enumerate() {
+                    ui.selectable_value(&mut tpms_idx, i, surface.label());
                 }
             });
-        if tpms_idx != prev_idx {
-            self.selected_tpms = TPMS_SURFACES[tpms_idx].0;
-            self.source = SurfaceSource::BuiltIn(self.selected_tpms);
-            // Reset period to the surface's default
-            let (def_k, def_cells) = {
-                let mut p = self.tree_params();
-                p.set_tpms_defaults(self.selected_tpms);
-                (p.tpms_period, p.tpms_cells)
-            };
-            self.tpms_period = def_k;
-            self.tpms_cells = def_cells;
+        if tpms_idx != current_idx {
+            let new_surface = tpms_surfaces[tpms_idx].clone();
+            self.source = new_surface.clone();
+            let params = new_surface.default_params();
+            self.tpms_period = params.tpms_period;
+            self.tpms_cells = params.tpms_cells;
             self.needs_remesh = true;
         }
-        // Show formula + period slider when a TPMS is the active source
-        if matches!(&self.source, SurfaceSource::BuiltIn(n)
-            if TPMS_SURFACES.iter().any(|(k,_)| k == n))
-        {
-            ui.add_space(4.0);
 
-            // ── Formula card ─────────────────────────────────
+        // ── Formula card ─────────────────────────────────
+        if self.tpms_active() {
+            ui.add_space(4.0);
             let frame_fill = ui.visuals().widgets.noninteractive.bg_fill;
             egui::Frame::new()
                 .fill(frame_fill)
                 .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
-                    if let Some(tex) = self.formula_cache.get(egui_ctx, self.selected_tpms) {
+                    if let Some(tex) = self.formula_cache.get(egui_ctx, self.source.name()) {
                         let size = tex.size_vec2();
                         let max_w = ui.available_width().max(240.0);
                         let scale = (max_w / size.x).min(1.0);
@@ -2029,11 +1066,69 @@ impl App {
                             egui::vec2(size.x * scale, size.y * scale),
                         ));
                     } else {
-                        ui.code(tpms_formula(self.selected_tpms));
+                        ui.code(tpms_formula(self.source.name()));
                     }
                 });
+        }
 
-            ui.add_space(6.0);
+        ui.add_space(8.0);
+        ui.separator();
+        // ── Custom expression ─────────────────────────────────
+        ui.label(egui::RichText::new("Custom expression (Rhai)").strong());
+        ui.horizontal(|ui| {
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.custom_expr)
+                .code_editor());
+            if resp.lost_focus() && resp.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                self.source = SurfaceType::Custom(self.custom_expr.clone());
+                self.needs_remesh = true;
+            }
+            if ui.button("Apply").clicked() {
+                self.source = SurfaceType::Custom(self.custom_expr.clone());
+                self.needs_remesh = true;
+            }
+        });
+        if let Some(err) = &self.custom_error {
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+        }
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("e.g.").small().color(ui.visuals().weak_text_color()));
+            if ui.link("sphere").clicked() {
+                self.custom_expr = "x*x + y*y + z*z - 0.64".into();
+                self.source = SurfaceType::Custom(self.custom_expr.clone());
+                self.needs_remesh = true;
+            }
+            ui.label(egui::RichText::new("|").small());
+            if ui.link("gyroid").clicked() {
+                self.custom_expr = "sin(4*x)*cos(4*y) + sin(4*y)*cos(4*z) + sin(4*z)*cos(4*x)".into();
+                self.source = SurfaceType::Custom(self.custom_expr.clone());
+                self.needs_remesh = true;
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        // ── Clip ──────────────────────────────────────────
+        ui.label("Bounding region:");
+        if ui.checkbox(&mut self.clip_to_unit_ball, "Clip to ball").changed() {
+            self.needs_remesh = true;
+        }
+        ui.indent("clip_opts", |ui| {
+            if ui.add(egui::Slider::new(&mut self.clip_radius, 0.2..=5.0)
+                    .text("Clip radius")).changed() {
+                self.needs_remesh = true;
+            }
+        });
+    }
+
+    fn ui_cell(&mut self, ui: &mut egui::Ui, _egui_ctx: &egui::Context) {
+        ui.heading("Cell");
+        if !self.tpms_active() {
+            ui.label("Select a TPMS surface first (Surface tab).");
+            return;
+        }
+        ui.label("Unit-cell period, array, size & amplitude.");
+        ui.add_space(6.0);
 
             // ── Parameters (Grid-aligned) ─────────────────────
             egui::Grid::new("tpms_params")
@@ -2067,20 +1162,275 @@ impl App {
                     }
                     ui.end_row();
                 });
+
+            // ── Cell size Lx/Ly/Lz ──
+            ui.add_space(4.0);
+            egui::Grid::new("cell_size_params")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Lx");
+                    if ui.add(egui::Slider::new(&mut self.tpms_cell_size[0], 0.25..=4.0)
+                        .text("")).changed() {
+                        self.needs_remesh = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Ly");
+                    if ui.add(egui::Slider::new(&mut self.tpms_cell_size[1], 0.25..=4.0)
+                        .text("")).changed() {
+                        self.needs_remesh = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Lz");
+                    if ui.add(egui::Slider::new(&mut self.tpms_cell_size[2], 0.25..=4.0)
+                        .text("")).changed() {
+                        self.needs_remesh = true;
+                    }
+                    ui.end_row();
+                });
+
+            // ── Amplitude a/b/c ──
+            ui.add_space(2.0);
+            egui::Grid::new("amplitude_params")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Amp a");
+                    if ui.add(egui::Slider::new(&mut self.tpms_amplitude[0], 0.1..=3.0)
+                        .text("")).changed() {
+                        self.needs_remesh = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Amp b");
+                    if ui.add(egui::Slider::new(&mut self.tpms_amplitude[1], 0.1..=3.0)
+                        .text("")).changed() {
+                        self.needs_remesh = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Amp c");
+                    if ui.add(egui::Slider::new(&mut self.tpms_amplitude[2], 0.1..=3.0)
+                        .text("")).changed() {
+                        self.needs_remesh = true;
+                    }
+                    ui.end_row();
+                });
+
+            // ── Offset C ──
+            ui.add_space(2.0);
+            if ui.add(egui::Slider::new(&mut self.tpms_offset, -2.0..=2.0)
+                .text("Offset C")).changed() {
+                self.needs_remesh = true;
+            }
             let total = self.tpms_cells[0] * self.tpms_cells[1] * self.tpms_cells[2];
             ui.label(egui::RichText::new(
                 format!("{} x {} x {} = {} cells",
                     self.tpms_cells[0], self.tpms_cells[1],
                     self.tpms_cells[2], total))
                 .small().color(ui.visuals().weak_text_color()));
+    }
 
-            ui.add_space(8.0);
-            ui.separator();
+    fn ui_deform(&mut self, ui: &mut egui::Ui, egui_ctx: &egui::Context) {
+        ui.heading("Deform");
+        if !self.tpms_active() {
+            ui.label("Select a TPMS surface first (Surface tab).");
+            return;
+        }
+        ui.label("Rotation, dual-TPMS blend & gradient fields.");
+        ui.add_space(6.0);
+
+            // ── Topology deformation: rotation ──
+            ui.collapsing("Rotation", |ui| {
+                egui::Grid::new("rotation_grid")
+                    .num_columns(2).spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Axis x");
+                        if ui.add(egui::Slider::new(&mut self.rotation_axis[0], -1.0..=1.0)
+                            .text("")).changed() { self.needs_remesh = true; }
+                        ui.end_row();
+                        ui.label("Axis y");
+                        if ui.add(egui::Slider::new(&mut self.rotation_axis[1], -1.0..=1.0)
+                            .text("")).changed() { self.needs_remesh = true; }
+                        ui.end_row();
+                        ui.label("Axis z");
+                        if ui.add(egui::Slider::new(&mut self.rotation_axis[2], -1.0..=1.0)
+                            .text("")).changed() { self.needs_remesh = true; }
+                        ui.end_row();
+                        ui.label("Angle (deg)");
+                        if ui.add(egui::Slider::new(&mut self.rotation_angle_deg, -180.0..=180.0)
+                            .text("")).changed() { self.needs_remesh = true; }
+                        ui.end_row();
+                    });
+            });
+
+            // ── Dual-TPMS weighted blend ──
             ui.add_space(4.0);
+            ui.collapsing("Dual-TPMS Blend", |ui| {
+                let mut enabled = self.blend_secondary.is_some();
+                if ui.checkbox(&mut enabled, "Enable blend f = w*f1 + (1-w)*f2").changed() {
+                    self.blend_secondary = if enabled {
+                        // Default: f1 on left half, f2 on right half, along x
+                        let nx = self.tpms_cells[0].max(1);
+                        self.blend_axis = 0;
+                        self.blend_f1_cells = [0, nx / 2 - 1];
+                        self.blend_f2_cells = [nx / 2 + 1, nx - 1];
+                        self.sync_blend_weight_from_cells();
+                        Some("schwarz-p".to_string())
+                    } else {
+                        self.blend_weight_field = GradientField::default();
+                        None
+                    };
+                    self.needs_remesh = true;
+                }
+                if let Some(ref mut sec) = self.blend_secondary {
+                    // ── Show both formulas ──
+                    let frame_fill = ui.visuals().widgets.noninteractive.bg_fill;
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("f1 (Primary):").strong());
+                    egui::Frame::new()
+                        .fill(frame_fill)
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .inner_margin(egui::Margin::same(6))
+                        .show(ui, |ui| {
+                            if let Some(tex) = self.formula_cache.get(egui_ctx, self.source.name()) {
+                                let size = tex.size_vec2();
+                                let max_w = ui.available_width().max(200.0);
+                                let scale = (max_w / size.x).min(0.8);
+                                ui.image(egui::load::SizedTexture::new(
+                                    tex.id(),
+                                    egui::vec2(size.x * scale, size.y * scale),
+                                ));
+                            } else {
+                                ui.code(tpms_formula(self.source.name()));
+                            }
+                        });
 
-            // ── Morphology ────────────────────────────────────
-            ui.label(egui::RichText::new("Morphology").strong());
-            ui.add_space(2.0);
+                    ui.add_space(4.0);
+                    let current = sec.clone();
+                    ui.label(egui::RichText::new("f2 (Secondary):").strong());
+                    egui::ComboBox::from_id_salt("blend_secondary_combo")
+                        .selected_text(
+                            SurfaceType::tpms_surfaces().iter()
+                                .find(|s| s.name() == current.as_str())
+                                .map(|s| s.label()).unwrap_or("Gyroid"))
+                        .show_ui(ui, |ui| {
+                            for s in SurfaceType::tpms_surfaces() {
+                                if ui.selectable_label(current == s.name(), s.label()).clicked() {
+                                    *sec = s.name().to_string();
+                                    self.needs_remesh = true;
+                                }
+                            }
+                        });
+                    egui::Frame::new()
+                        .fill(frame_fill)
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .inner_margin(egui::Margin::same(6))
+                        .show(ui, |ui| {
+                            if let Some(tex) = self.formula_cache.get(egui_ctx, sec.as_str()) {
+                                let size = tex.size_vec2();
+                                let max_w = ui.available_width().max(200.0);
+                                let scale = (max_w / size.x).min(0.8);
+                                ui.image(egui::load::SizedTexture::new(
+                                    tex.id(),
+                                    egui::vec2(size.x * scale, size.y * scale),
+                                ));
+                            } else {
+                                ui.code(tpms_formula(sec.as_str()));
+                            }
+                        });
+
+                    // ── Spatial transition by cell range ──
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Spatial transition:").strong());
+                    ui.label(egui::RichText::new(
+                        "w=1 ⟶ f1 only  |  w=0 ⟶ f2 only")
+                        .small().color(ui.visuals().weak_text_color()));
+                    ui.add_space(4.0);
+
+                    let axis_labels = ["X", "Y", "Z"];
+                    egui::Grid::new("blend_cell_grid")
+                        .num_columns(2).spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("Direction");
+                            let mut ax = self.blend_axis;
+                            egui::ComboBox::from_id_salt("blend_axis_combo")
+                                .selected_text(axis_labels[ax as usize])
+                                .show_ui(ui, |ui| {
+                                    for (i, lbl) in axis_labels.iter().enumerate() {
+                                        ui.selectable_value(&mut ax, i as u32, *lbl);
+                                    }
+                                });
+                            if ax != self.blend_axis {
+                                self.blend_axis = ax;
+                                self.sync_blend_weight_from_cells();
+                            }
+                            ui.end_row();
+
+                            let n = self.tpms_cells[self.blend_axis as usize].max(1);
+                            ui.label("f1 cells");
+                            let mut f1s = self.blend_f1_cells[0].min(n - 1);
+                            let mut f1e = self.blend_f1_cells[1].min(n - 1);
+                            let resp1 = ui.horizontal(|ui| {
+                                ui.label("[");
+                                let r1 = ui.add(egui::DragValue::new(&mut f1s).range(0..=n-1));
+                                ui.label(",");
+                                let r2 = ui.add(egui::DragValue::new(&mut f1e).range(0..=n-1));
+                                ui.label("]");
+                                r1.union(r2)
+                            }).inner;
+                            if resp1.changed() {
+                                self.blend_f1_cells = [f1s, f1e];
+                                self.sync_blend_weight_from_cells();
+                            }
+                            ui.end_row();
+
+                            ui.label("f2 cells");
+                            let mut f2s = self.blend_f2_cells[0].min(n - 1);
+                            let mut f2e = self.blend_f2_cells[1].min(n - 1);
+                            let resp2 = ui.horizontal(|ui| {
+                                ui.label("[");
+                                let r1 = ui.add(egui::DragValue::new(&mut f2s).range(0..=n-1));
+                                ui.label(",");
+                                let r2 = ui.add(egui::DragValue::new(&mut f2e).range(0..=n-1));
+                                ui.label("]");
+                                r1.union(r2)
+                            }).inner;
+                            if resp2.changed() {
+                                self.blend_f2_cells = [f2s, f2e];
+                                self.sync_blend_weight_from_cells();
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.add_space(4.0);
+                    ui.collapsing("Advanced: manual weight field", |ui| {
+                        gradient_field_ui(ui, &mut self.blend_weight_field,
+                                          &mut self.needs_remesh, "blend_w");
+                    });
+                }
+            });
+
+            // ── Offset C as spatial gradient field ──
+            ui.add_space(4.0);
+            ui.collapsing("Offset C(x,y,z) gradient", |ui| {
+                ui.label("Replaces scalar Offset C (Cell tab) when mode != None.");
+                gradient_field_ui(ui, &mut self.offset_field,
+                                  &mut self.needs_remesh, "offset_c");
+            });
+    }
+
+    fn ui_morph(&mut self, ui: &mut egui::Ui, egui_ctx: &egui::Context) {
+        ui.heading("Morph");
+        if !self.tpms_active() {
+            ui.label("Select a TPMS surface first (Surface tab).");
+            return;
+        }
+        ui.label("Minimal surface / Shell / Skeletal.");
+        ui.add_space(6.0);
+
             let mut morph = self.morphology;
             ui.horizontal(|ui| {
                 if ui.radio_value(&mut morph, Morphology::MinimalSurface, "Minimal").changed() {
@@ -2114,13 +1464,13 @@ impl App {
                 match self.morphology {
                     Morphology::Shell => {
                         if ui.add(egui::Slider::new(&mut self.tpms_thickness,
-                            0.02..=0.5).text("Wall t")).changed() {
+                                    0.02..=0.5).text("Wall t")).changed() {
                             self.needs_remesh = true;
                         }
                     }
                     Morphology::Skeletal => {
                         if ui.add(egui::Slider::new(&mut self.tpms_vol_frac,
-                            0.01..=0.99).text("Vol frac")).changed() {
+                                    0.01..=0.99).text("Vol frac")).changed() {
                             self.needs_remesh = true;
                         }
                         ui.label(egui::RichText::new(
@@ -2130,60 +1480,10 @@ impl App {
                     Morphology::MinimalSurface => {}
                 }
             });
-        }
-
-        ui.add_space(8.0);
-        ui.separator();
-        // ── Custom expression ─────────────────────────────────
-        ui.label(egui::RichText::new("Custom expression (Rhai)").strong());
-        ui.horizontal(|ui| {
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.custom_expr)
-                .code_editor());
-            if resp.lost_focus() && resp.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.source = SurfaceSource::Custom;
-                self.needs_remesh = true;
-            }
-            if ui.button("Apply").clicked() {
-                self.source = SurfaceSource::Custom;
-                self.needs_remesh = true;
-            }
-        });
-        if let Some(err) = &self.custom_error {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
-        }
-        ui.add_space(2.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("e.g.").small().color(ui.visuals().weak_text_color()));
-            if ui.link("sphere").clicked() {
-                self.custom_expr = "x*x + y*y + z*z - 0.64".into();
-                self.source = SurfaceSource::Custom;
-                self.needs_remesh = true;
-            }
-            ui.label(egui::RichText::new("|").small());
-            if ui.link("gyroid").clicked() {
-                self.custom_expr = "sin(4*x)*cos(4*y) + sin(4*y)*cos(4*z) + sin(4*z)*cos(4*x)".into();
-                self.source = SurfaceSource::Custom;
-                self.needs_remesh = true;
-            }
-        });
-
-        ui.add_space(8.0);
-        ui.separator();
-        // ── Clip ──────────────────────────────────────────
-        ui.label("Bounding region:");
-        if ui.checkbox(&mut self.clip_to_unit_ball, "Clip to ball").changed() {
-            self.needs_remesh = true;
-        }
-        ui.indent("clip_opts", |ui| {
-            if ui.add(egui::Slider::new(&mut self.clip_radius, 0.2..=5.0)
-                .text("Clip radius")).changed() {
-                self.needs_remesh = true;
-            }
-        });
     }
 
     fn ui_mesh(&mut self, ui: &mut egui::Ui) {
-        ui.heading("2. Mesh");
+        ui.heading("Mesh");
         ui.label("Polygonisation backend:");
         if ui.selectable_label(self.mesh_backend == MeshBackend::MarchingCubes33,
             "Marching Cubes 33 (smooth boundary)").clicked() {
@@ -2241,7 +1541,7 @@ impl App {
     fn ui_display(&mut self, ui: &mut egui::Ui,
         render_state: &mut engvis_core::material::RenderState)
     {
-        ui.heading("3. Display");
+        ui.heading("Display");
 
         // ── Background ─────────────────────────────────────
         ui.horizontal(|ui| {
@@ -2303,7 +1603,7 @@ impl App {
             });
         }
 
-        // ── Points ─────────────────────────────────────────
+        // ── Points ──────────────────────────────────────────
         ui.checkbox(&mut render_state.vertex_opts.enabled, "Show points");
         if render_state.vertex_opts.enabled {
             ui.indent("point_opts", |ui| {
@@ -2343,7 +1643,7 @@ impl App {
     }
 
     fn ui_topology(&mut self, ui: &mut egui::Ui) {
-        ui.heading("4. Topology");
+        ui.heading("Topology");
         match &self.last_topology {
             None => { ui.label("(no mesh loaded)"); }
             Some(t) => {
@@ -2373,11 +1673,20 @@ fn main() {
         // 在单位立方体内均匀采样，统计各 TPMS 函数的 [min, max] 值域，
         // 用于判断 UI 中 C value slider 范围是否合理。
         eprintln!("\n[tpms range] sampling value ranges (period=4.0, N=64³):");
-        for &(name, _) in TPMS_SURFACES {
+        for surface_type in SurfaceType::tpms_surfaces() {
+            let name = surface_type.name();
             let p2 = TreeParams {
                 name, sphere_radius: 0.8,
                 torus_major_r: 0.6, torus_minor_r: 0.2,
                 tpms_period: 4.0, tpms_cells: [1, 1, 1],
+                tpms_cell_size: [1.0, 1.0, 1.0],
+                tpms_amplitude: [1.0, 1.0, 1.0],
+                tpms_offset: 0.0,
+                rotation_axis: [0.0, 0.0, 1.0],
+                rotation_angle: 0.0,
+                blend_secondary: None,
+                blend_weight_field: GradientField::default(),
+                offset_field: GradientField::default(),
             };
             let tree2 = build_tree(&p2);
             use fidget_core::shape::Shape;
@@ -2390,11 +1699,11 @@ fn main() {
             let mut ys = Vec::with_capacity(n*n*n);
             let mut zs = Vec::with_capacity(n*n*n);
             for ix in 0..n {
-                let x = -1.0 + 2.0 * ix as f32 / n as f32;
+                let x = -1.0 + 2.0 * ix as f32 / (n - 1) as f32;
                 for iy in 0..n {
-                    let y = -1.0 + 2.0 * iy as f32 / n as f32;
+                    let y = -1.0 + 2.0 * iy as f32 / (n - 1) as f32;
                     for iz in 0..n {
-                        xs.push(x); ys.push(y); zs.push(-1.0 + 2.0 * iz as f32 / n as f32);
+                        xs.push(x); ys.push(y); zs.push(-1.0 + 2.0 * iz as f32 / (n - 1) as f32);
                     }
                 }
             }
@@ -2413,7 +1722,15 @@ fn main() {
         // the zero-set, producing a different mesh.
         let p = TreeParams { name: "gyroid", sphere_radius: 0.8,
             torus_major_r: 0.6, torus_minor_r: 0.2,
-            tpms_period: 4.0, tpms_cells: [1, 1, 1] };
+            tpms_period: 4.0, tpms_cells: [1, 1, 1],
+            tpms_cell_size: [1.0, 1.0, 1.0],
+            tpms_amplitude: [1.0, 1.0, 1.0],
+            tpms_offset: 0.0,
+            rotation_axis: [0.0, 0.0, 1.0],
+            rotation_angle: 0.0,
+            blend_secondary: None,
+            blend_weight_field: GradientField::default(),
+            offset_field: GradientField::default() };
         let tree = build_tree(&p);
         for phi in [0.3_f32, 0.5, 0.7] {
             let c_val = solve_c_for_vol_frac(&tree, phi);
@@ -2424,7 +1741,7 @@ fn main() {
                 false, 1.0, Morphology::MinimalSurface, [1.0, 1.0, 1.0],
             );
             // Mean |f - C| over the mesh: should be ≈0 since vertices
-            // lie on f = C  ⇔  (f − C) = 0.
+            // lie on f = C ⇔ (f − C) = 0.
             use fidget_core::shape::Shape;
             use fidget_jit::JitFunction;
             let shifted = Shape::<JitFunction>::from(tree.clone() - c_val);
@@ -2479,8 +1796,7 @@ fn main() {
     }
 
     engvis_renderer::run(App {
-        source: SurfaceSource::BuiltIn("gyroid"),
-        selected_tpms: "gyroid",
+        source: SurfaceType::Gyroid,
         custom_expr: "sin(4*x)*cos(4*y) + sin(4*y)*cos(4*z) + sin(4*z)*cos(4*x)".to_string(),
         custom_error: None,
         clip_to_unit_ball: false,
@@ -2493,6 +1809,17 @@ fn main() {
         tpms_thickness: 0.1,
         tpms_vol_frac: 0.5,
         cached_c_value: 0.0,
+        tpms_cell_size: [1.0, 1.0, 1.0],
+        tpms_amplitude: [1.0, 1.0, 1.0],
+        tpms_offset: 0.0,
+        rotation_axis: [0.0, 0.0, 1.0],
+        rotation_angle_deg: 0.0,
+        blend_secondary: None,
+        blend_weight_field: GradientField::default(),
+        blend_axis: 0,
+        blend_f1_cells: [0, 0],
+        blend_f2_cells: [1, 1],
+        offset_field: GradientField::default(),
         morphology: Morphology::MinimalSurface,
         mesh_backend: MeshBackend::MarchingCubes33,
         surf_depth: 7,
@@ -2512,7 +1839,7 @@ fn main() {
         surface_roughness: 0.18,
         env_intensity: 1.0,
         background_color: [1.0, 1.0, 1.0],
-        current_step: Step::Source,
+        current_tab: Tab::Surface,
         pending_load: None,
         pending_save: None,
         needs_remesh: false,

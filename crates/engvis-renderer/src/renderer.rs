@@ -584,9 +584,11 @@ impl Renderer {
                 .create_object_bind_group(device, world_transform);
             render_pass.set_bind_group(1, &obj_bg, &[]);
             render_pass.set_bind_group(2, &overlay_bg, &[]);
-            render_pass.set_vertex_buffer(0, mesh_buf.edge_endpoint_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.overlay_renderer.line_quad_buffer.slice(..));
-            render_pass.draw(0..6, 0..mesh_buf.edge_instance_count);
+            if let Some(ref buf) = mesh_buf.edge_endpoint_buffer {
+                render_pass.set_vertex_buffer(0, buf.slice(..));
+                render_pass.set_vertex_buffer(1, self.overlay_renderer.line_quad_buffer.slice(..));
+                render_pass.draw(0..6, 0..mesh_buf.edge_instance_count);
+            }
         }
 
         for child in &node.children {
