@@ -90,15 +90,7 @@ jobs:
             DEB_VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
             mkdir -p deb_staging/usr/bin deb_staging/DEBIAN
             cp engvis deb_staging/usr/bin/
-            cat > deb_staging/DEBIAN/control <<EOF
-Package: engvis
-Version: ${DEB_VERSION}
-Section: graphics
-Priority: optional
-Architecture: amd64
-Maintainer: nil
-Description: Engineering visualization framework with GPU rendering
-EOF
+            printf 'Package: engvis\nVersion: %s\nSection: graphics\nPriority: optional\nArchitecture: amd64\nMaintainer: nil\nDescription: Engineering visualization framework with GPU rendering\n' "${DEB_VERSION}" > deb_staging/DEBIAN/control
             dpkg-deb --build deb_staging ../../../artifacts/engvis-${{ matrix.target }}.deb
           fi
 
