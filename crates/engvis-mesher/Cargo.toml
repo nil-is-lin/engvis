@@ -5,11 +5,19 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Mesh generation algorithms (DC, MC33, shell, MS-loops) for engvis"
+keywords = ["mesh", "marching-cubes", "isosurface", "geometry", "cad"]
+categories = ["graphics", "rendering"]
+homepage = "https://github.com/nil-is-lin/engvis"
+repository = "https://github.com/nil-is-lin/engvis"
 
 [dependencies]
-engvis-surface = { path = "../engvis-surface" }
-engvis-core = { path = "../engvis-core" }
+engvis-surface = { path = "../engvis-surface", version = "0.1.5" }
+engvis-core = { path = "../engvis-core", version = "0.1.5" }
 fidget-core.workspace = true
 fidget-jit.workspace = true
 fidget-mesh.workspace = true
 glam.workspace = true
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

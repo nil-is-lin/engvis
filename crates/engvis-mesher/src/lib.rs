@@ -11,6 +11,9 @@ use engvis_core::{
 use engvis_surface::Morphology;
 use glam::Vec3;
 
+// ── Trait-based multi-stage pipeline ───────────────────
+pub mod pipeline;
+
 // ── Mesh backend enum ─────────────────────────────────
 
 /// Polygonisation backend.
@@ -539,38 +542,26 @@ pub fn build_mesh(
     morphology: Morphology,
     domain_extent: [f32; 3],
 ) -> (Mesh, String) {
-    let [sx, sy, sz] = domain_extent;
-    let max_extent = sx.max(sy).max(sz).max(1.0);
-    let pad = 4.0 / mc_res as f32;
+    use pipeline::{BallClip, DynamicMeshPipeline, GradientNormalRecompute, MeshPostProcessor};
 
-    let is_solid = matches!(morphology, Morphology::Skeletal);
-    let (mut mesh, gen_stats) = if is_solid {
-        use fidget_core::context::Tree as T;
-        let half = max_extent + pad;
-        let cell = 2.0 * half / (mc_res as f32 * half).ceil();
-        let (cx, cy, cz) = (sx - 0.5 * cell, sy - 0.5 * cell, sz - 0.5 * cell);
-        let box_sdf = (T::x().abs() - cx).max(T::y().abs() - cy).max(T::z().abs() - cz);
-        let clipped = tree.clone().max(box_sdf);
-        let mc_extent = [sx + pad, sy + pad, sz + pad];
-        match backend {
-            MeshBackend::DualContouring => build_dc_mesh(clipped, name, depth),
-            MeshBackend::MarchingCubes33 => build_mc33_mesh_domain(clipped, name, mc_res, mc_extent),
-        }
-    } else {
-        let mc_extent = [sx + pad, sy + pad, sz + pad];
-        match backend {
-            MeshBackend::DualContouring => build_dc_mesh(tree.clone(), name, depth),
-            MeshBackend::MarchingCubes33 => build_mc33_mesh_domain(tree.clone(), name, mc_res, mc_extent),
-        }
-    };
+    // Delegate to the trait-based pipeline. The legacy `MeshBackend` enum is
+    // only a config bridge that produces a `Box<dyn Polygonizer>` here.
+    let polygonizer = backend.make_polygonizer(depth, mc_res);
+    let mut posts: Vec<Box<dyn MeshPostProcessor>> = Vec::new();
     if clip_to_unit_ball {
-        clip_mesh_to_ball(&mut mesh, [0.0, 0.0, 0.0], clip_radius);
-        let clip_msg = format!(" | clip({}v/{}t)", mesh.vertices.len(), mesh.indices.len() / 3);
-        recompute_smooth_normals(&mut mesh);
-        (mesh, format!("{gen_stats}{clip_msg}"))
-    } else {
-        (mesh, gen_stats)
+        posts.push(Box::new(BallClip {
+            center: [0.0, 0.0, 0.0],
+            radius: clip_radius,
+        }));
+        posts.push(Box::new(GradientNormalRecompute));
     }
+    let pipe = DynamicMeshPipeline {
+        polygonizer,
+        posts,
+        morphology,
+        mc_res,
+    };
+    pipe.run(tree, name, domain_extent)
 }
 
 // ── Marching Squares (MS-loop visualisation) ─────────────
