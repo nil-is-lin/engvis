@@ -64,7 +64,7 @@ engvis 是一个以**三周期极小曲面 (Triply Periodic Minimal Surface, TPM
 
 - **MC33 (Marching Cubes 33)**：规则网格采样，自适应分辨率（1–512），Shell 模式最少 96³
 - **Dual Contouring (DC)**：自适应八叉树，可调深度，保留尖锐特征
-- **JIT 编译求值**：通过 [Fidget](https://github.com/nil-is-lin/fidget) 将隐式曲面的表达式树编译为平台原生代码，实时采样性能媲美手写函数
+- **JIT 编译求值**：通过 [Fidget](https://github.com/mkeeter/fidget) 将隐式曲面的表达式树编译为平台原生代码，实时采样性能媲美手写函数
 - **边界封闭 (Boundary Capping)**：Shell 和 Skeletal 网格通过 CSG 与包围盒相交，结合边界环扇形补面算法生成无边界边的封闭实体
 - **Newton 投影**：Skeletal 模式下将交界顶点投影到 TPMS 与盒子面的精确交线上，消除阶梯锯齿
 - **异步构建**：高分辨率网格在后台线程构建，保持 UI 响应
@@ -186,7 +186,7 @@ cargo run --release
 | [wgpu](https://github.com/gfx-rs/wgpu) | 跨平台 GPU 抽象层 |
 | [winit](https://github.com/rust-windowing/winit) | 窗口管理和事件处理 |
 | [egui](https://github.com/emilk/egui) | 即时模式 GUI |
-| [fidget](https://github.com/nil-is-lin/fidget) | JIT 隐式曲面求值 |
+| [fidget](https://github.com/mkeeter/fidget) | JIT 隐式曲面求值 |
 | [glam](https://github.com/bitshifter/glam-rs) | 数学库（向量、矩阵、四元数） |
 | [rfd](https://github.com/PolyMeilex/rfd) | 原生文件对话框 |
 | [bytemuck](https://github.com/Lokathor/bytemuck) | 零拷贝类型转换 |

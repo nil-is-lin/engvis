@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Implicit surface definitions and TPMS formula library for engvis"
+keywords = ["tpms", "minimal-surface", "implicit-surface", "math", "cad"]
+categories = ["mathematics", "graphics"]
+homepage = "https://github.com/nil-is-lin/engvis"
+repository = "https://github.com/nil-is-lin/engvis"
 
 [dependencies]
 fidget-core.workspace = true

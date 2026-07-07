@@ -1,5 +1,5 @@
 [package]
-name = "engvis"
+name = "engvis-cli"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,10 +9,10 @@ repository = "https://github.com/nil-is-lin/engvis"
 readme = "README.md"
 
 [dependencies]
-engvis-core = { path = "crates/engvis-core" }
-engvis-renderer = { path = "crates/engvis-renderer" }
-engvis-surface = { path = "crates/engvis-surface" }
-engvis-mesher = { path = "crates/engvis-mesher" }
+engvis-core = { path = "crates/engvis-core", version = "0.1.5" }
+engvis-renderer = { path = "crates/engvis-renderer", version = "0.1.5" }
+engvis-surface = { path = "crates/engvis-surface", version = "0.1.5" }
+engvis-mesher = { path = "crates/engvis-mesher", version = "0.1.5" }
 wgpu.workspace = true
 winit.workspace = true
 egui.workspace = true
@@ -39,6 +39,7 @@ members = [
     "crates/engvis-renderer",
     "crates/engvis-surface",
     "crates/engvis-mesher",
+    "crates/engvis",
     "fidget-demo", "examples/colorbar3d",
 ]
 
@@ -47,6 +48,7 @@ version = "0.1.5"
 edition = "2024"
 authors = ["nil"]
 license = "MIT"
+repository = "https://github.com/nil-is-lin/engvis"
 
 [workspace.dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
