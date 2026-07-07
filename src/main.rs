@@ -5,7 +5,7 @@ mod mesh_io;
 mod formula_cache;
 
 use engvis_core::{
-    material::PbrMaterial,
+    material::{PbrMaterial, RenderState, EdgeRenderOptions},
     scene::{Scene, SceneNode},
     camera::OrbitCamera,
     topology::compute_topology,
@@ -232,25 +232,25 @@ struct App {
     simplify_ratio: f32,
     simplify_stats: String,
 
-    // ── edge / vertex overlay (persisted across rebuilds) ──
+    // ── render state (single source of truth for display/overlay opts) ──
+    // Owned by the App and pushed to the renderer each frame via
+    // `FrameCtx::set_render_state`.  Per-node overrides that require a
+    // remesh (below) are kept as separate fields.
+    render_state: RenderState,
+    // Triangle-mesh edges of the *surface* node — toggling this requires
+    // reapplying `render_edges` on the node, which happens on remesh.
     show_surface_edges: bool,
-    edge_color: [f32; 3],
-    edge_line_width: f32,
     // Bounding-wireframe appearance, independent of the surface-edge
     // overlay above.  Applied as a per-node override in `build_scene`.
     wireframe_color: [f32; 3],
     wireframe_line_width: f32,
 
-    // ── surface appearance ──
+    // ── surface appearance (PBR material; requires remesh) ──
     surface_color: [f32; 3],
     /// PBR metallic factor (0 = dielectric, 1 = metal).
     surface_metallic: f32,
     /// PBR roughness factor (0 = mirror, 1 = fully rough).
     surface_roughness: f32,
-    /// Environment / IBL intensity multiplier.
-    env_intensity: f32,
-    /// Background clear color (RGB, each channel 0..1).
-    background_color: [f32; 3],
 
     // ── workflow / UI ──
     current_tab: Tab,
@@ -772,11 +772,12 @@ impl EngvisApp for App {
         //    only nodes with `render_edges=true` are affected.  Edge color
         //    and line width come from the App (controlled in the
         //    Display panel) so the user's choice persists across remeshes.
-        frame.render_state.edge_opts.enabled = true;
-        frame.render_state.edge_opts.color = self.edge_color;
-        frame.render_state.edge_opts.line_width = self.edge_line_width;
-        frame.render_state.background_color = self.background_color;
-        frame.render_state.env_intensity = self.env_intensity;
+        // Edge overlay enabled so the bounding box / sphere shows up;
+        // only nodes with `render_edges=true` are affected.  The App owns
+        // the `RenderState` as the single source of truth and pushes it to
+        // the renderer each frame via `set_render_state`.
+        self.render_state.edge_opts.enabled = true;
+        frame.set_render_state(self.render_state);
         if !self.camera_fitted {
             frame.camera.fit_to_scene(frame.scene);
             self.camera_fitted = true;
@@ -820,9 +821,9 @@ impl EngvisApp for App {
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut frame.render_state.show_surface, "Surface");
-                    ui.checkbox(&mut frame.render_state.show_grid, "Grid");
-                    ui.checkbox(&mut frame.render_state.vertex_opts.enabled, "Points");
+                    ui.checkbox(&mut self.render_state.show_surface, "Surface");
+                    ui.checkbox(&mut self.render_state.show_grid, "Grid");
+                    ui.checkbox(&mut self.render_state.vertex_opts.enabled, "Points");
                     ui.checkbox(&mut self.show_bounding, "Bounding wireframe")
                         .on_hover_text("Re-mesh to apply");
                     ui.checkbox(&mut self.show_ms_loops, "MS boundary loops")
@@ -924,7 +925,7 @@ impl EngvisApp for App {
                             Tab::Deform  => self.ui_deform(ui, egui_ctx),
                             Tab::Morph   => self.ui_morph(ui, egui_ctx),
                             Tab::Mesh    => self.ui_mesh(ui),
-                            Tab::Display => self.ui_display(ui, frame.render_state),
+                            Tab::Display => self.ui_display(ui),
                             Tab::Topo    => self.ui_topology(ui),
                         }
                     });
@@ -1538,20 +1539,18 @@ impl App {
         }
     }
 
-    fn ui_display(&mut self, ui: &mut egui::Ui,
-        render_state: &mut engvis_core::material::RenderState)
-    {
+    fn ui_display(&mut self, ui: &mut egui::Ui) {
         ui.heading("Display");
 
         // ── Background ─────────────────────────────────────
         ui.horizontal(|ui| {
             ui.label("Background");
-            ui.color_edit_button_rgb(&mut self.background_color);
+            ui.color_edit_button_rgb(&mut self.render_state.background_color);
         });
 
         // ── Surface ────────────────────────────────────────
-        ui.checkbox(&mut render_state.show_surface, "Show triangle surface");
-        if render_state.show_surface {
+        ui.checkbox(&mut self.render_state.show_surface, "Show triangle surface");
+        if self.render_state.show_surface {
             ui.indent("surface_opts", |ui| {
                 if ui.horizontal(|ui| {
                     ui.label("Color");
@@ -1559,7 +1558,7 @@ impl App {
                 }).inner.changed() {
                     self.needs_remesh = true;
                 }
-                ui.add(egui::Slider::new(&mut render_state.opacity, 0.0..=1.0)
+                ui.add(egui::Slider::new(&mut self.render_state.opacity, 0.0..=1.0)
                     .text("Opacity"));
 
                 // ── PBR Material ──────────────────────────
@@ -1579,7 +1578,7 @@ impl App {
                 {
                     self.needs_remesh = true;
                 }
-                ui.add(egui::Slider::new(&mut self.env_intensity, 0.0..=3.0)
+                ui.add(egui::Slider::new(&mut self.render_state.env_intensity, 0.0..=3.0)
                     .text("Env intensity"))
                     .on_hover_text("IBL environment light multiplier");
             });
@@ -1596,22 +1595,22 @@ impl App {
             ui.indent("edge_opts", |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Color");
-                    ui.color_edit_button_rgb(&mut self.edge_color);
+                    ui.color_edit_button_rgb(&mut self.render_state.edge_opts.color);
                 });
-                ui.add(egui::Slider::new(&mut self.edge_line_width, 0.5..=10.0)
+                ui.add(egui::Slider::new(&mut self.render_state.edge_opts.line_width, 0.5..=10.0)
                     .text("Line width (px)"));
             });
         }
 
         // ── Points ──────────────────────────────────────────
-        ui.checkbox(&mut render_state.vertex_opts.enabled, "Show points");
-        if render_state.vertex_opts.enabled {
+        ui.checkbox(&mut self.render_state.vertex_opts.enabled, "Show points");
+        if self.render_state.vertex_opts.enabled {
             ui.indent("point_opts", |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Color");
-                    ui.color_edit_button_rgb(&mut render_state.vertex_opts.color);
+                    ui.color_edit_button_rgb(&mut self.render_state.vertex_opts.color);
                 });
-                ui.add(egui::Slider::new(&mut render_state.vertex_opts.point_size, 1.0..=12.0)
+                ui.add(egui::Slider::new(&mut self.render_state.vertex_opts.point_size, 1.0..=12.0)
                     .text("Point size"));
             });
         }
@@ -1619,7 +1618,7 @@ impl App {
         // ── Other overlays ─────────────────────────────────
         ui.add_space(6.0);
         ui.separator();
-        ui.checkbox(&mut render_state.show_grid, "World grid");
+        ui.checkbox(&mut self.render_state.show_grid, "World grid");
         if ui.checkbox(&mut self.show_bounding, "Show bounding wireframe").changed() {
             self.needs_remesh = true;
         }
@@ -1830,15 +1829,21 @@ fn main() {
         simplify_ratio: 0.25,
         simplify_stats: String::new(),
         show_surface_edges: false,
-        edge_color: [0.35, 0.35, 0.35],
-        edge_line_width: 2.0,
+        render_state: RenderState {
+            edge_opts: EdgeRenderOptions {
+                enabled: true,
+                color: [0.35, 0.35, 0.35],
+                line_width: 2.0,
+            },
+            background_color: [1.0, 1.0, 1.0],
+            env_intensity: 1.0,
+            ..Default::default()
+        },
         wireframe_color: [0.3, 0.3, 0.3],
         wireframe_line_width: 2.0,
         surface_color: [0.30, 0.65, 0.90],
         surface_metallic: 0.9,
         surface_roughness: 0.18,
-        env_intensity: 1.0,
-        background_color: [1.0, 1.0, 1.0],
         current_tab: Tab::Surface,
         pending_load: None,
         pending_save: None,
