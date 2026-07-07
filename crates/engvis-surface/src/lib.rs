@@ -46,9 +46,9 @@ impl SurfaceType {
             SurfaceType::FRD => "f-rd",
             SurfaceType::Lidinoid => "lidinoid",
             SurfaceType::SplitP => "split-p",
-            SurfaceType::FischerKochSY => "fischer-koch-s-y",
-            SurfaceType::FischerKochSCP => "fischer-koch-s-cp",
-            SurfaceType::FischerKochSC => "fischer-koch-s-c",
+            SurfaceType::FischerKochSY => "fischer-koch-s",
+            SurfaceType::FischerKochSCP => "fischer-koch-cp",
+            SurfaceType::FischerKochSC => "fischer-koch-y",
             SurfaceType::Custom(_) => "custom",
         }
     }
@@ -66,9 +66,9 @@ impl SurfaceType {
             SurfaceType::FRD => "F-RD",
             SurfaceType::Lidinoid => "Lidinoid",
             SurfaceType::SplitP => "Split-P",
-            SurfaceType::FischerKochSY => "Fischer-Koch S-Y",
-            SurfaceType::FischerKochSCP => "Fischer-Koch S-CP",
-            SurfaceType::FischerKochSC => "Fischer-Koch S-C",
+            SurfaceType::FischerKochSY => "Fischer-Koch S",
+            SurfaceType::FischerKochSCP => "Fischer-Koch CP",
+            SurfaceType::FischerKochSC => "Fischer-Koch Y",
             SurfaceType::Custom(_) => "Custom",
         }
     }
@@ -175,9 +175,9 @@ impl SurfaceType {
             "f-rd" => Some(SurfaceType::FRD),
             "lidinoid" => Some(SurfaceType::Lidinoid),
             "split-p" => Some(SurfaceType::SplitP),
-            "fischer-koch-s-y" => Some(SurfaceType::FischerKochSY),
-            "fischer-koch-s-cp" => Some(SurfaceType::FischerKochSCP),
-            "fischer-koch-s-c" => Some(SurfaceType::FischerKochSC),
+            "fischer-koch-s" => Some(SurfaceType::FischerKochSY),
+            "fischer-koch-cp" => Some(SurfaceType::FischerKochSCP),
+            "fischer-koch-y" => Some(SurfaceType::FischerKochSC),
             _ => None,
         }
     }
@@ -506,6 +506,12 @@ mod tests {
         assert_eq!(SurfaceType::Gyroid.name(), "gyroid");
         assert_eq!(SurfaceType::Sphere.name(), "sphere");
         assert_eq!(SurfaceType::Custom("test".to_string()).name(), "custom");
+        // Fischer-Koch: these names must match the eval_tpms_formula /
+        // set_tpms_defaults / tpms_formula match arms, otherwise the
+        // surface silently falls through to the default (gyroid).
+        assert_eq!(SurfaceType::FischerKochSY.name(), "fischer-koch-s");
+        assert_eq!(SurfaceType::FischerKochSCP.name(), "fischer-koch-cp");
+        assert_eq!(SurfaceType::FischerKochSC.name(), "fischer-koch-y");
     }
 
     #[test]
@@ -513,6 +519,9 @@ mod tests {
         assert_eq!(SurfaceType::Gyroid.label(), "Gyroid");
         assert_eq!(SurfaceType::SchwarzP.label(), "Schwarz P");
         assert_eq!(SurfaceType::FRD.label(), "F-RD");
+        assert_eq!(SurfaceType::FischerKochSY.label(), "Fischer-Koch S");
+        assert_eq!(SurfaceType::FischerKochSCP.label(), "Fischer-Koch CP");
+        assert_eq!(SurfaceType::FischerKochSC.label(), "Fischer-Koch Y");
     }
 
     #[test]
@@ -528,6 +537,25 @@ mod tests {
         assert_eq!(SurfaceType::from_name("gyroid"), Some(SurfaceType::Gyroid));
         assert_eq!(SurfaceType::from_name("sphere"), Some(SurfaceType::Sphere));
         assert_eq!(SurfaceType::from_name("invalid"), None);
+        // Fischer-Koch round-trips (name ↔ variant).
+        assert_eq!(SurfaceType::from_name("fischer-koch-s"), Some(SurfaceType::FischerKochSY));
+        assert_eq!(SurfaceType::from_name("fischer-koch-cp"), Some(SurfaceType::FischerKochSCP));
+        assert_eq!(SurfaceType::from_name("fischer-koch-y"), Some(SurfaceType::FischerKochSC));
+    }
+
+    /// Every TPMS `name()` must resolve to a dedicated formula description.
+    /// Catches the class of bug where `name()` drifts from the `eval_tpms_formula`
+    /// / `tpms_formula` match arms and the surface silently renders as gyroid.
+    #[test]
+    fn tpms_names_resolve_to_real_formula() {
+        for s in SurfaceType::tpms_surfaces() {
+            let n = s.name();
+            let desc = tpms_formula(n);
+            assert_ne!(
+                desc, "(unknown)",
+                "{n} has no formula description — name() likely drifted from tpms_formula arms"
+            );
+        }
     }
 
     #[test]
