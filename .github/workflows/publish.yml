@@ -5,9 +5,14 @@ name: Publish crates to crates.io
 #      (simplest - no tag needed).
 #   2. Tag:     `git tag vX.Y.Z && git push origin vX.Y.Z`
 #
-# Requires a repo secret CARGO_REGISTRY_TOKEN containing a crates.io token
-# with the `publish` scope. The token is NEVER committed to the repo - it is
-# injected at runtime from Settings > Secrets and variables > Actions.
+# Requires a repo secret CARGO_REGISTRY_TOKEN containing a *crates.io* token
+# (NOT a GitHub token) with the `publish` scope, owned by the crate owner
+# account. The token is NEVER committed to the repo - it is injected at
+# runtime from Settings > Secrets and variables > Actions.
+#
+# IMPORTANT: if `cargo publish` fails for every retry (e.g. bad/expired
+# token, missing scope, or non-owner account), this workflow FAILS the run
+# loudly (exit 1) rather than reporting a silent green success.
 
 on:
   workflow_dispatch:
@@ -33,47 +38,27 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # core has no internal deps - publish first. Retry guards against
-      # transient crates.io hiccups.
-      - name: Publish engvis-core
+      - name: Publish crates in topological order
         run: |
-          for i in $(seq 1 10); do
-            cargo publish -p engvis-core && break
-            echo "publish attempt $i failed, retrying in 20s..."
-            sleep 20
-          done
-
-      # Each later crate waits (with retry) for the previous version to
-      # propagate through the crates.io index before its own publish.
-      - name: Publish engvis-surface
-        run: |
-          for i in $(seq 1 10); do
-            cargo publish -p engvis-surface && break
-            echo "index not propagated yet (attempt $i), waiting 20s..."
-            sleep 20
-          done
-
-      - name: Publish engvis-mesher
-        run: |
-          for i in $(seq 1 10); do
-            cargo publish -p engvis-mesher && break
-            echo "index not propagated yet (attempt $i), waiting 20s..."
-            sleep 20
-          done
-
-      - name: Publish engvis-renderer
-        run: |
-          for i in $(seq 1 10); do
-            cargo publish -p engvis-renderer && break
-            echo "index not propagated yet (attempt $i), waiting 20s..."
-            sleep 20
-          done
-
-      # facade `engvis` depends on all four.
-      - name: Publish engvis (facade)
-        run: |
-          for i in $(seq 1 10); do
-            cargo publish -p engvis && break
-            echo "index not propagated yet (attempt $i), waiting 20s..."
-            sleep 20
+          set -euo pipefail
+          CRATES=(engvis-core engvis-surface engvis-mesher engvis-renderer engvis)
+          for crate in "${CRATES[@]}"; do
+            echo "=== Publishing $crate ==="
+            attempt=0
+            max=12
+            # `cargo publish` returns non-zero on auth/index errors -> retry;
+            # but give up (exit 1) after `max` attempts so a bad token fails
+            # the whole run instead of reporting a silent green success.
+            until cargo publish -p "$crate" --no-verify; do
+              attempt=$((attempt + 1))
+              if [ "$attempt" -ge "$max" ]; then
+                echo "::error::Failed to publish $crate after $max attempts"
+                exit 1
+              fi
+              echo "attempt $attempt failed, retrying in 20s..."
+              sleep 20
+            done
+            echo "::notice::Published $crate"
+            # Let crates.io index propagate before the next dependent crate.
+            sleep 30
           done
