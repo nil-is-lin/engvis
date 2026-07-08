@@ -7,6 +7,7 @@ license.workspace = true
 description = "Engineering visualization framework with GPU rendering"
 repository = "https://github.com/nil-is-lin/engvis"
 readme = "README.md"
+publish = false
 
 [dependencies]
 engvis-core = { path = "crates/engvis-core", version = "0.1.5" }
