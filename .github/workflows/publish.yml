@@ -41,15 +41,50 @@ jobs:
       - name: Publish crates in topological order
         run: |
           set -euo pipefail
+          # All crates share one version via `version.workspace = true`.
+          VERSION="$(awk '/^\[workspace\.package\]/{f=1} f && /^version[[:space:]]*=/{print; exit}' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "Workspace version: $VERSION"
+
+          # True if <crate>@$VERSION is already on crates.io (idempotency guard).
+          # crates.io API requires a User-Agent header.
+          already_published() {
+            local crate="$1"
+            curl -sf -H "User-Agent: engvis-ci" \
+              "https://crates.io/api/v1/crates/${crate}" \
+              | grep -q "\"num\":\"${VERSION}\""
+          }
+
+          # `cargo publish` returns 0 on success, non-zero on failure.
+          # A failure caused by the version already existing is treated as a
+          # skip (success) so re-triggered tags don't fail the run.
+          publish_or_skip() {
+            local crate="$1" out
+            if out="$(cargo publish -p "$crate" --no-verify 2>&1)"; then
+              return 0
+            fi
+            if echo "$out" | grep -qi "already exists"; then
+              echo "::notice::${crate}@${VERSION} already on crates.io - skipping"
+              return 0
+            fi
+            echo "$out"
+            return 1
+          }
+
           CRATES=(engvis-core engvis-surface engvis-mesher engvis-renderer engvis)
           for crate in "${CRATES[@]}"; do
+            if already_published "$crate"; then
+              echo "::notice::${crate}@${VERSION} already on crates.io - skipping (pre-check)"
+              continue
+            fi
             echo "=== Publishing $crate ==="
             attempt=0
             max=12
-            # `cargo publish` returns non-zero on auth/index errors -> retry;
-            # but give up (exit 1) after `max` attempts so a bad token fails
-            # the whole run instead of reporting a silent green success.
-            until cargo publish -p "$crate" --no-verify; do
+            # Retry transient auth/index errors, but give up (exit 1) after
+            # `max` attempts so a bad token fails the run loudly, not silently.
+            while true; do
+              if publish_or_skip "$crate"; then
+                break
+              fi
               attempt=$((attempt + 1))
               if [ "$attempt" -ge "$max" ]; then
                 echo "::error::Failed to publish $crate after $max attempts"
