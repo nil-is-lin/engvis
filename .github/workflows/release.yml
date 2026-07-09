@@ -67,7 +67,7 @@ jobs:
 
       - name: Strip (non-Windows)
         if: runner.os != 'Windows'
-        run: strip target/${{ matrix.target }}/release/engvis
+        run: strip target/${{ matrix.target }}/release/engvis-cli
 
       - name: Package
         shell: bash
@@ -75,23 +75,23 @@ jobs:
           mkdir -p artifacts
           cd target/${{ matrix.target }}/release
           if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a ../../../artifacts/engvis-${{ matrix.target }}.zip engvis.exe
-            cp engvis.exe ../../../artifacts/engvis-${{ matrix.target }}.exe
+            7z a ../../../artifacts/engvis-cli-${{ matrix.target }}.zip engvis-cli.exe
+            cp engvis-cli.exe ../../../artifacts/engvis-cli-${{ matrix.target }}.exe
           elif [ "$RUNNER_OS" = "macOS" ]; then
-            chmod +x engvis
+            chmod +x engvis-cli
             mkdir -p dmg_staging
-            cp engvis dmg_staging/
-            hdiutil create -volname engvis -srcfolder dmg_staging \
-              -ov -format UDZO ../../../artifacts/engvis-${{ matrix.target }}.dmg
-            tar czf ../../../artifacts/engvis-${{ matrix.target }}.tar.gz engvis
+            cp engvis-cli dmg_staging/
+            hdiutil create -volname engvis-cli -srcfolder dmg_staging \
+              -ov -format UDZO ../../../artifacts/engvis-cli-${{ matrix.target }}.dmg
+            tar czf ../../../artifacts/engvis-cli-${{ matrix.target }}.tar.gz engvis-cli
           else
-            chmod +x engvis
-            tar czf ../../../artifacts/engvis-${{ matrix.target }}.tar.gz engvis
+            chmod +x engvis-cli
+            tar czf ../../../artifacts/engvis-cli-${{ matrix.target }}.tar.gz engvis-cli
             DEB_VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
             mkdir -p deb_staging/usr/bin deb_staging/DEBIAN
-            cp engvis deb_staging/usr/bin/
-            printf 'Package: engvis\nVersion: %s\nSection: graphics\nPriority: optional\nArchitecture: amd64\nMaintainer: nil\nDescription: Engineering visualization framework with GPU rendering\n' "${DEB_VERSION}" > deb_staging/DEBIAN/control
-            dpkg-deb --build deb_staging ../../../artifacts/engvis-${{ matrix.target }}.deb
+            cp engvis-cli deb_staging/usr/bin/
+            printf 'Package: engvis-cli\nVersion: %s\nSection: graphics\nPriority: optional\nArchitecture: amd64\nMaintainer: nil\nDescription: Engineering visualization framework with GPU rendering\n' "${DEB_VERSION}" > deb_staging/DEBIAN/control
+            dpkg-deb --build deb_staging ../../../artifacts/engvis-cli-${{ matrix.target }}.deb
           fi
 
       - name: Upload to release
