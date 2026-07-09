@@ -16,6 +16,19 @@ use crate::postprocess::PostProcessPipeline;
 
 
 
+/// Maximum number of point/line overlay instances the renderer will draw for
+/// a single mesh node.
+///
+/// Overlays (vertices as instanced point-quads, edges as instanced line-quads)
+/// are drawn with `draw(0..6, 0..N)` where `N` is the element count. For very
+/// dense meshes (hundreds of thousands to millions of elements) this instance
+/// count — multiplied by 4x MSAA and FXAA overdraw — can stall the GPU long
+/// enough to trip a driver timeout and freeze the window. Above this cap we
+/// silently skip the overlay for that node; the triangle surface still renders.
+/// The App additionally detects dense meshes (see `DENSE_MESH_VERTS`) so the UI
+/// can explain why points/edges are not shown.
+pub const MAX_OVERLAY_ELEMENTS: u32 = 2_000_000;
+
 /// Scene uniform data (group 0)
 ///
 /// `global_opacity`: `[opacity, env_intensity, _, _]`
@@ -511,6 +524,7 @@ impl Renderer {
             && mesh_idx < self.mesh_renderer.mesh_buffers.len()
             && let mesh_buf = &self.mesh_renderer.mesh_buffers[mesh_idx]
             && mesh_buf.vertex_count > 0
+            && mesh_buf.vertex_count <= MAX_OVERLAY_ELEMENTS
         {
             render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
             let (_obj_buf, obj_bg) = self
@@ -571,6 +585,7 @@ impl Renderer {
             && mesh_idx < self.mesh_renderer.mesh_buffers.len()
             && let mesh_buf = &self.mesh_renderer.mesh_buffers[mesh_idx]
             && mesh_buf.edge_instance_count > 0
+            && mesh_buf.edge_instance_count <= MAX_OVERLAY_ELEMENTS
         {
             let color = node.edge_color_override.unwrap_or(default_color);
             let width = node.edge_width_override.unwrap_or(default_width);

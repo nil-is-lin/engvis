@@ -1,14 +1,15 @@
 // engvis-mesher: mesh generation algorithms (DC, MC33, shell, MS-loops).
 //
-// Depends on `engvis-surface` (for `TreeParams`, `Morphology`, `build_tree`)
-// and `engvis-core` (for `Mesh`, `SubMesh`, `Aabb`, `compute_topology`).
+// Depends on `engvis-surface` (for `TreeParams`, `build_tree`),
+// `engvis-tpms` (for `Morphology`), and `engvis-core`
+// (for `Mesh`, `SubMesh`, `Aabb`, `compute_topology`).
 
 use engvis_core::{
     aabb::Aabb,
     mesh::{Mesh, MeshVertex, SubMesh},
     topology::compute_topology,
 };
-use engvis_surface::Morphology;
+use engvis_tpms::Morphology;
 use glam::Vec3;
 
 // ── Trait-based multi-stage pipeline ───────────────────

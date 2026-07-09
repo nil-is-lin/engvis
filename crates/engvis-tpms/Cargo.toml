@@ -1,0 +1,16 @@
+[package]
+name = "engvis-tpms"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Triply periodic minimal surface (TPMS) families, formulas, and morphology for engvis"
+keywords = ["tpms", "minimal-surface", "implicit-surface", "math", "cad"]
+categories = ["mathematics", "graphics"]
+homepage = "https://github.com/nil-is-lin/engvis"
+repository = "https://github.com/nil-is-lin/engvis"
+
+[dependencies]
+fidget-core.workspace = true
+fidget-rhai.workspace = true
+fidget-jit.workspace = true

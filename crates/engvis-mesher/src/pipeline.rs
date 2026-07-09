@@ -12,7 +12,7 @@
 // struct + trait impl + one enum arm — no `match` sprawl in `build_mesh`.
 
 use engvis_core::mesh::Mesh;
-use engvis_surface::Morphology;
+use engvis_tpms::Morphology;
 use serde::{Deserialize, Serialize};
 
 use crate::MeshBackend;

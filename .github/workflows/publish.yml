@@ -70,7 +70,7 @@ jobs:
             return 1
           }
 
-          CRATES=(engvis-core engvis-surface engvis-mesher engvis-renderer engvis)
+          CRATES=(engvis-core engvis-surface engvis-tpms engvis-mesher engvis-renderer engvis)
           for crate in "${CRATES[@]}"; do
             if already_published "$crate"; then
               echo "::notice::${crate}@${VERSION} already on crates.io - skipping (pre-check)"

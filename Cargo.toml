@@ -13,6 +13,7 @@ publish = false
 engvis-core = { path = "crates/engvis-core", version = "0.1.5" }
 engvis-renderer = { path = "crates/engvis-renderer", version = "0.1.5" }
 engvis-surface = { path = "crates/engvis-surface", version = "0.1.5" }
+engvis-tpms = { path = "crates/engvis-tpms", version = "0.1.5" }
 engvis-mesher = { path = "crates/engvis-mesher", version = "0.1.5" }
 wgpu.workspace = true
 winit.workspace = true
@@ -39,6 +40,7 @@ members = [
     "crates/engvis-core",
     "crates/engvis-renderer",
     "crates/engvis-surface",
+    "crates/engvis-tpms",
     "crates/engvis-mesher",
     "crates/engvis",
     "fidget-demo", "examples/colorbar3d",

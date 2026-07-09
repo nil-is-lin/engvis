@@ -1113,6 +1113,7 @@ dependencies = [
  "engvis-mesher",
  "engvis-renderer",
  "engvis-surface",
+ "engvis-tpms",
 ]
 
 [[package]]
@@ -1126,6 +1127,7 @@ dependencies = [
  "engvis-mesher",
  "engvis-renderer",
  "engvis-surface",
+ "engvis-tpms",
  "env_logger",
  "fidget-core",
  "fidget-jit",
@@ -1160,6 +1162,7 @@ version = "0.1.5"
 dependencies = [
  "engvis-core",
  "engvis-surface",
+ "engvis-tpms",
  "fidget-core",
  "fidget-jit",
  "fidget-mesh",
@@ -1191,6 +1194,15 @@ name = "engvis-surface"
 version = "0.1.5"
 dependencies = [
  "fidget-core",
+ "fidget-rhai",
+]
+
+[[package]]
+name = "engvis-tpms"
+version = "0.1.5"
+dependencies = [
+ "fidget-core",
+ "fidget-jit",
  "fidget-rhai",
 ]
 

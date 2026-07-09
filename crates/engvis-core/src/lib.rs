@@ -12,12 +12,14 @@ pub mod annotation;
 pub mod topology;
 pub mod bourke_table;
 pub mod marching_cubes;
+pub mod selection;
 
 pub use camera::OrbitCamera;
 pub use input::{InputState, ViewportRect};
 pub use scene::{Scene, SceneNode};
 pub use mesh::{Mesh, MeshVertex, SubMesh, fix_winding, dedup_vertices};
 pub use material::{PbrMaterial, VertexRenderOptions, EdgeRenderOptions, RenderState};
+pub use selection::{Selection, project_to_pixel, DEFAULT_PICK_THRESHOLD_PX};
 pub use light::{AmbientLight, DirectionalLight, PointLight, LightingEnvironment};
 pub use aabb::Aabb;
 pub use topology::{MeshTopology, compute_topology};

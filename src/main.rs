@@ -9,14 +9,18 @@ use engvis_core::{
     scene::{Scene, SceneNode},
     camera::OrbitCamera,
     topology::compute_topology,
+    selection::{Selection, project_to_pixel},
+    Mesh,
     Aabb,
 };
 use engvis_renderer::{
     EngvisApp, AppCtx, FrameCtx, RunConfig, EventHandling, load_gltf,
 };
 use engvis_surface::{
-    GradientField, GradientMode, TreeParams, Morphology,
-    SurfaceType, tpms_formula, build_tree, build_tree_from_rhai,
+    TreeParams, SurfaceType, build_tree, build_tree_from_rhai,
+};
+use engvis_tpms::{
+    GradientField, GradientMode, Morphology, TpmsFamily, TpmsSurface, tpms_formula,
 };
 use engvis_mesher::{
     MeshBackend, build_box_wireframe, build_sphere_wireframe,
@@ -122,61 +126,20 @@ enum Tab {
     Topo,    // topology stats
 }
 
-/// 二分查找 C 值使 vol_frac(C) = target_phi。
-///
-/// vol_frac(C) = |{p ∈ domain : f(p) < C}| / |domain|
-/// 是 C 的单调递增函数，可用二分查找求解。
-///
-/// 采样在 [-1,1]³ 上进行，N=48³（~110K 点，JIT eval 约 1ms）。
-fn solve_c_for_vol_frac(
-    tree: &fidget_core::context::Tree,
-    target_phi: f32,
-) -> f32 {
-    use fidget_core::shape::Shape;
-    use fidget_jit::JitFunction;
-
-    let phi = target_phi.clamp(0.001, 0.999);
-
-    let shape = Shape::<JitFunction>::from(tree.clone());
-    let tape = shape.float_slice_tape(Default::default());
-    let mut eval = Shape::<JitFunction>::new_float_slice_eval();
-
-    // 采样网格
-    let n = 48i32;
-    let total = (n * n * n) as usize;
-    let mut xs = Vec::with_capacity(total);
-    let mut ys = Vec::with_capacity(total);
-    let mut zs = Vec::with_capacity(total);
-    for ix in 0..n {
-        let x = -1.0 + 2.0 * ix as f32 / (n - 1) as f32;
-        for iy in 0..n {
-            let y = -1.0 + 2.0 * iy as f32 / (n - 1) as f32;
-            for iz in 0..n {
-                xs.push(x);
-                ys.push(y);
-                zs.push(-1.0 + 2.0 * iz as f32 / (n - 1) as f32);
-            }
-        }
-    }
-
-    let vals = match eval.eval(&tape, &xs, &ys, &zs) {
-        Ok(r) => r.to_vec(),
-        Err(_) => return 0.0,
-    };
-
-    // 二分查找：找到 C 使 vals 中 < C 的比例 = phi
-    let mut sorted: Vec<f32> = vals.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    // vol_frac(C) = count(vals < C) / total
-    // 目标：count = phi * total
-    let target_count = (phi * total as f32).round() as usize;
-    let idx = target_count.min(total - 1);
-    sorted[idx]
-}
+/// Meshes with more vertices than this are treated as "dense": instanced
+/// point/edge overlays are capped by the renderer (above `MAX_OVERLAY_ELEMENTS`)
+/// to avoid GPU stalls, and the UI shows a hint. 250k is a conservative point
+/// where overlay instancing starts costing more than it informs.
+const DENSE_MESH_VERTS: usize = 250_000;
 
 struct App {
     // ── implicit surface source ──
     source: SurfaceType,
+    /// Active TPMS family, if the current surface is a TPMS. None for
+    /// primitives / custom. This is the "TPMS is its own type" selector
+    /// (ADR-003); the raw `tpms_*` fields below are assembled into a
+    /// `TpmsSurface` when building the tree.
+    tpms_family: Option<TpmsFamily>,
     custom_expr: String,
     custom_error: Option<String>,
     clip_to_unit_ball: bool,
@@ -264,6 +227,25 @@ struct App {
     camera_fitted: bool,
     last_topology: Option<engvis_core::topology::MeshTopology>,
     last_build_ok: bool,
+    /// True when the current mesh is too dense for instanced point/edge
+    /// overlays. The renderer caps overlays per node above
+    /// `MAX_OVERLAY_ELEMENTS`; this flag drives the UI hint so the user
+    /// understands why points/edges are not drawn.
+    dense_mesh: bool,
+
+    // ── element selection (view/interaction state, not model) ──
+    /// Currently selected element (vertex / edge / face / none).
+    selection: Selection,
+    /// CPU mesh retained for picking + highlight projection.
+    pick_mesh: Option<Mesh>,
+    /// Deduplicated edge list (vertex-index pairs) for the pick mesh.
+    pick_edges: Option<Vec<u32>>,
+    /// Cursor position at last `CursorMoved` (physical px), for click/drag detection.
+    last_cursor: [f64; 2],
+    /// Cursor position when the left button was pressed.
+    press_cursor: Option<[f64; 2]>,
+    /// Set on a left-button release that was a click (not a drag); consumed in `on_frame`.
+    pending_pick: bool,
 
     // ── formula SVG texture cache ──
     formula_cache: formula_cache::FormulaCache,
@@ -282,6 +264,7 @@ struct App {
 #[derive(Clone)]
 struct AppBuildSnapshot {
     source: SurfaceType,
+    tpms_family: Option<TpmsFamily>,
     clip_to_unit_ball: bool,
     clip_radius: f32,
     sphere_radius: f32,
@@ -324,6 +307,7 @@ impl AppBuildSnapshot {
     fn from_app(app: &App) -> Self {
         Self {
             source: app.source.clone(),
+            tpms_family: app.tpms_family,
             clip_to_unit_ball: app.clip_to_unit_ball,
             clip_radius: app.clip_radius,
             sphere_radius: app.sphere_radius,
@@ -359,30 +343,45 @@ impl AppBuildSnapshot {
     }
 
     fn surface_label(&self) -> String {
-        self.source.label().to_string()
+        if let Some(f) = self.tpms_family {
+            f.label().to_string()
+        } else {
+            self.source.label().to_string()
+        }
     }
 
+    /// Assemble a `TpmsSurface` from the raw UI fields for the active family.
+    fn make_tpms_surface(&self, family: TpmsFamily) -> TpmsSurface {
+        TpmsSurface {
+            family,
+            period: self.tpms_period,
+            cells: self.tpms_cells,
+            cell_size: self.tpms_cell_size,
+            amplitude: self.tpms_amplitude,
+            offset: self.tpms_offset,
+            vol_frac: self.tpms_vol_frac,
+            thickness: self.tpms_thickness,
+            blend_secondary: self.blend_secondary.clone(),
+            blend_weight_field: self.blend_weight_field,
+            offset_field: self.offset_field,
+        }
+    }
+
+    /// Primitive-only tree params (TPMS is built via `TpmsSurface`).
     fn tree_params(&self) -> TreeParams<'_> {
         TreeParams {
             name: self.source.name(),
             sphere_radius: self.sphere_radius,
             torus_major_r: self.torus_major_r,
             torus_minor_r: self.torus_minor_r,
-            tpms_period: self.tpms_period,
-            tpms_cell_size: self.tpms_cell_size,
-            tpms_amplitude: self.tpms_amplitude,
-            tpms_offset: self.tpms_offset,
-            tpms_cells: self.tpms_cells,
-            rotation_axis: self.rotation_axis,
-            rotation_angle: self.rotation_angle_deg.to_radians(),
-            blend_secondary: self.blend_secondary.as_deref(),
-            blend_weight_field: self.blend_weight_field,
-            offset_field: self.offset_field,
         }
     }
 
     fn current_tree(&self) -> Result<fidget_core::context::Tree, String> {
-        if let SurfaceType::Custom(expr) = &self.source {
+        if let Some(family) = self.tpms_family {
+            let tpms = self.make_tpms_surface(family);
+            Ok(tpms.build_tree(self.rotation_axis, self.rotation_angle_deg.to_radians()))
+        } else if let SurfaceType::Custom(expr) = &self.source {
             build_tree_from_rhai(expr)
         } else {
             let p = self.tree_params();
@@ -401,6 +400,7 @@ impl AppBuildSnapshot {
                 return MeshBuildResult {
                     scene: Scene::default(),
                     topology: None,
+                    mesh: None,
                     build_ok: false,
                     error: Some(e),
                     c_value: 0.0,
@@ -412,19 +412,11 @@ impl AppBuildSnapshot {
 
         let label = self.surface_label();
 
-        let shell_grad = if self.source.is_tpms() {
-            // |grad f| ≈ k（单元晶胞内的最大梯度）。
-            // 幅值系数放大梯度，取三轴最大值。
-            let k = self.tpms_period.max(1.0);
-            let amp_max = self.tpms_amplitude[0]
-                .max(self.tpms_amplitude[1])
-                .max(self.tpms_amplitude[2]);
-            k * amp_max
-        } else {
-            1.0
-        };
+        let tpms = self.tpms_family.map(|f| self.make_tpms_surface(f));
+
+        let shell_grad = tpms.as_ref().map(|t| t.shell_grad()).unwrap_or(1.0);
         let shell_half_t = if matches!(self.morphology, Morphology::Shell) {
-            0.5 * self.tpms_thickness * shell_grad
+            0.5 * tpms.as_ref().map(|t| t.thickness).unwrap_or(0.0) * shell_grad
         } else {
             0.0
         };
@@ -433,9 +425,8 @@ impl AppBuildSnapshot {
         // 用户设置体积分数 φ，内部二分查找 C 使 vol_frac(C) = φ。
         // vol_frac(C) = |{p : f(p) < C}| / |domain|，是 C 的单调递增函数。
         // 仅 Skeletal 模式使用；MinimalSurface 固定 f=0，与 C 无关。
-        let c_value = if matches!(self.morphology, Morphology::Skeletal)
-        {
-            solve_c_for_vol_frac(&tree, self.tpms_vol_frac)
+        let c_value = if matches!(self.morphology, Morphology::Skeletal) {
+            tpms.as_ref().map(|t| t.solve_c(&tree) as f32).unwrap_or(0.0)
         } else {
             0.0
         };
@@ -449,16 +440,16 @@ impl AppBuildSnapshot {
             }
         };
         let effective_res = {
-            let mut min_feature = match self.source {
-                SurfaceType::Torus => 2.0 * self.torus_minor_r,
-                _ if self.source.is_tpms() => {
-                    // 最小特征尺寸由最高频方向决定（周期 k）。
-                    std::f32::consts::PI / self.tpms_period
-                }
-                _ => 0.5,
+            let mut min_feature = match &tpms {
+                Some(t) => t.min_feature(),
+                None => if let SurfaceType::Torus = self.source {
+                    2.0 * self.torus_minor_r
+                } else {
+                    0.5
+                },
             };
             if matches!(self.morphology, Morphology::Shell) {
-                let wall = self.tpms_thickness;
+                let wall = tpms.as_ref().map(|t| t.thickness).unwrap_or(0.0);
                 if wall < min_feature {
                     min_feature = wall;
                 }
@@ -473,15 +464,10 @@ impl AppBuildSnapshot {
             needed
         };
         // Domain extent: for TPMS, per-axis cell counts; otherwise unit cube.
-        let domain_extent = if self.source.is_tpms() {
-            [
-                self.tpms_cells[0] as f32 * self.tpms_cell_size[0],
-                self.tpms_cells[1] as f32 * self.tpms_cell_size[1],
-                self.tpms_cells[2] as f32 * self.tpms_cell_size[2],
-            ]
-        } else {
-            [1.0, 1.0, 1.0]
-        };
+        let domain_extent = tpms
+            .as_ref()
+            .map(|t| t.domain_extent())
+            .unwrap_or([1.0, 1.0, 1.0]);
         let (mut mesh, mut build_stats) = if matches!(self.morphology, Morphology::Shell) {
             build_shell_mesh(
                 tree.clone(), shell_half_t, &label, effective_res,
@@ -517,6 +503,7 @@ impl AppBuildSnapshot {
             roughness: self.surface_roughness,
             ..Default::default()
         };
+        let pick_mesh = mesh.clone();
         let mut scene = Scene::single_mesh(&label, mesh, mat);
         if let Some(n) = scene.nodes.first_mut() {
             n.render_edges = self.show_surface_edges;
@@ -552,11 +539,10 @@ impl AppBuildSnapshot {
             let wf_mesh = if self.clip_to_unit_ball {
                 build_sphere_wireframe(self.clip_radius, 12, 24)
                 } else {
-                let extent = if self.source.is_tpms() {
-                    [self.tpms_cells[0] as f32, self.tpms_cells[1] as f32, self.tpms_cells[2] as f32]
-                } else {
-                    [1.0, 1.0, 1.0]
-                };
+                let extent = tpms
+                    .as_ref()
+                    .map(|t| t.cells_f32())
+                    .unwrap_or([1.0, 1.0, 1.0]);
                 build_box_wireframe(extent)
             };
             let wf_mat = PbrMaterial { name: "wireframe".into(), ..Default::default() };
@@ -579,6 +565,7 @@ impl AppBuildSnapshot {
         MeshBuildResult {
             scene,
             topology,
+            mesh: Some(pick_mesh),
             build_ok: true,
             error: None,
             c_value,
@@ -592,6 +579,8 @@ impl AppBuildSnapshot {
 struct MeshBuildResult {
     scene: Scene,
     topology: Option<engvis_core::topology::MeshTopology>,
+    /// Retained CPU mesh for picking / highlight projection (if available).
+    mesh: Option<Mesh>,
     build_ok: bool,
     error: Option<String>,
     /// 由体积分数 φ 求解得到的 C 值（仅 MinimalSurface/Skeletal 有意义）。
@@ -614,6 +603,8 @@ impl App {
         self.last_topology = result.topology;
         self.last_build_ok = result.build_ok;
         self.cached_c_value = result.c_value;
+        self.pick_mesh = result.mesh.clone();
+        self.pick_edges = result.mesh.as_ref().map(|m| m.extract_edge_indices());
         if let Some(e) = &result.error {
             self.custom_error = Some(e.clone());
         }
@@ -623,6 +614,10 @@ impl App {
     /// Replace the current scene with a single imported mesh.
     fn load_external_mesh(&mut self, path: &std::path::Path) -> Result<Scene, String> {
         let mesh = mesh_io::load_mesh(path)?;
+        // Retain the CPU mesh so element picking works on imported geometry.
+        let pick_mesh = mesh.clone();
+        self.pick_edges = Some(pick_mesh.extract_edge_indices());
+        self.pick_mesh = Some(pick_mesh);
         self.last_topology = Some(compute_topology(&mesh));
         self.last_build_ok = true;
         let aabb = mesh.aabb;
@@ -687,10 +682,28 @@ impl EngvisApp for App {
                 } else {
                     self.custom_error = None;
                     self.build_status = "ready".into();
-                    self.build_stats = result.build_stats;
-                    self.simplify_stats = result.simplify_stats;
-                }
-                *frame.scene = result.scene;
+                self.build_stats = result.build_stats;
+                self.simplify_stats = result.simplify_stats;
+            }
+            self.pick_mesh = result.mesh.clone();
+            self.pick_edges = result.mesh.as_ref().map(|m| m.extract_edge_indices());
+            // Dense-mesh guard: instanced point/edge overlays over a very large
+            // mesh (hundreds of thousands of elements) combined with 4x MSAA and
+            // FXAA overdraw can stall the GPU long enough to freeze the window.
+            // The renderer caps overlays per node above `MAX_OVERLAY_ELEMENTS`;
+            // we record the state here so the UI can explain why points/edges
+            // are not shown, and surface a status hint.
+            self.dense_mesh = result
+                .mesh
+                .as_ref()
+                .map(|m| m.vertices.len() > DENSE_MESH_VERTS)
+                .unwrap_or(false);
+            if self.dense_mesh {
+                let nv = result.mesh.as_ref().map(|m| m.vertices.len()).unwrap_or(0);
+                self.build_status =
+                    format!("ready · overlays capped ({nv} verts too dense)");
+            }
+            *frame.scene = result.scene;
                 // Fit camera to new scene bounds.
                 frame.camera.fit_to_scene(frame.scene);
                 *frame.scene_dirty = true;
@@ -733,8 +746,12 @@ impl EngvisApp for App {
                             frame.camera.fit_to_aabb(aabb);
                             *frame.scene_dirty = true;
                             // Glb may contain multiple meshes; topology stats are
-                            // not aggregated here.
+                            // not aggregated here.  Clear pick mesh (no single
+                            // CPU mesh to pick against).
                             self.last_topology = None;
+                            self.pick_mesh = None;
+                            self.pick_edges = None;
+                            self.selection = Selection::None;
                         }
                         Err(e) => eprintln!("glTF load failed: {e}"),
                     }
@@ -930,19 +947,182 @@ impl EngvisApp for App {
                         }
                     });
             });
+
+        // ── Selection visual feedback (egui overlay) ──
+        self.draw_selection_overlay(egui_ctx, frame);
     }
 
-    fn on_frame(&mut self, _frame: &mut FrameCtx) {}
+    fn on_frame(&mut self, frame: &mut FrameCtx) {
+        if self.pending_pick {
+            self.pending_pick = false;
+            // Don't pick when the click landed on an egui widget (slider, etc.).
+            if !frame.egui_wants_pointer {
+                if let Some(mesh) = &self.pick_mesh {
+                    let cursor = [frame.cursor_x, frame.cursor_y];
+                    self.selection =
+                        mesh.pick(frame.camera, cursor, frame.viewport, 8.0);
+                }
+            }
+        }
+    }
 
-    fn on_event(&mut self, _event: &winit::event::WindowEvent) -> EventHandling {
+    fn on_event(&mut self, event: &winit::event::WindowEvent) -> EventHandling {
+        use winit::event::{ElementState, MouseButton};
+        match event {
+            winit::event::WindowEvent::CursorMoved { position, .. } => {
+                self.last_cursor = [position.x, position.y];
+            }
+            winit::event::WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state: ElementState::Pressed,
+                ..
+            } => {
+                self.press_cursor = Some(self.last_cursor);
+            }
+            winit::event::WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state: ElementState::Released,
+                ..
+            } => {
+                // Treat as a click (not a drag/orbit) only if the cursor
+                // barely moved between press and release.
+                if let Some(press) = self.press_cursor {
+                    let dx = self.last_cursor[0] - press[0];
+                    let dy = self.last_cursor[1] - press[1];
+                    if (dx * dx + dy * dy).sqrt() < 4.0 {
+                        self.pending_pick = true;
+                    }
+                }
+                self.press_cursor = None;
+            }
+            _ => {}
+        }
         EventHandling::Default
     }
 }
 
 impl App {
+    /// Draw selection visual feedback as an egui overlay anchored to the 3D
+    /// elements.  The marker is re-projected every frame so it tracks the
+    /// model as the camera orbits.  Drawn on the background layer so the side
+    /// panels stay on top of it.
+    fn draw_selection_overlay(&self, egui_ctx: &egui::Context, frame: &FrameCtx) {
+        let mesh = match &self.pick_mesh {
+            Some(m) => m,
+            None => return,
+        };
+        let edges = self.pick_edges.as_deref();
+        let ppp = egui_ctx.pixels_per_point();
+        let painter = egui_ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("engvis_selection"),
+        ));
+        let proj = |w: [f32; 3]| -> Option<egui::Pos2> {
+            project_to_pixel(w, &frame.camera.view_projection(), frame.viewport)
+                .map(|p| egui::pos2((p[0] / ppp as f64) as f32, (p[1] / ppp as f64) as f32))
+        };
+        let accent = egui::Color32::from_rgb(255, 153, 0);
+        match self.selection {
+            Selection::None => {}
+            Selection::Vertex(i) => {
+                let i = i as usize;
+                if i >= mesh.vertices.len() {
+                    return;
+                }
+                let p = match proj(mesh.vertices[i].position) {
+                    Some(p) => p,
+                    None => return,
+                };
+                painter.circle_filled(p, 9.0, accent);
+                painter.circle_filled(p, 4.0, egui::Color32::WHITE);
+                painter.text(
+                    p + egui::vec2(12.0, -10.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("vertex #{}", i),
+                    egui::FontId::default(),
+                    accent,
+                );
+            }
+            Selection::Edge(e) => {
+                let edges = match edges {
+                    Some(e) => e,
+                    None => return,
+                };
+                let k = e as usize * 2;
+                if k + 1 >= edges.len() {
+                    return;
+                }
+                let a = edges[k] as usize;
+                let b = edges[k + 1] as usize;
+                if a >= mesh.vertices.len() || b >= mesh.vertices.len() {
+                    return;
+                }
+                let pa = match proj(mesh.vertices[a].position) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let pb = match proj(mesh.vertices[b].position) {
+                    Some(p) => p,
+                    None => return,
+                };
+                painter.line_segment([pa, pb], (3.0, accent));
+                let mid = egui::pos2((pa.x + pb.x) * 0.5, (pa.y + pb.y) * 0.5);
+                painter.text(
+                    mid + egui::vec2(0.0, -10.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    format!("edge #{}", e),
+                    egui::FontId::default(),
+                    accent,
+                );
+            }
+            Selection::Face(f) => {
+                let f = f as usize * 3;
+                if f + 2 >= mesh.indices.len() {
+                    return;
+                }
+                let p0 = match proj(mesh.vertices[mesh.indices[f] as usize].position) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let p1 =
+                    match proj(mesh.vertices[mesh.indices[f + 1] as usize].position) {
+                        Some(p) => p,
+                        None => return,
+                    };
+                let p2 =
+                    match proj(mesh.vertices[mesh.indices[f + 2] as usize].position) {
+                        Some(p) => p,
+                        None => return,
+                    };
+                painter.add(egui::Shape::convex_polygon(
+                    vec![p0, p1, p2],
+                    egui::Color32::from_rgba_unmultiplied(255, 153, 0, 40),
+                    (2.0, accent),
+                ));
+                let cx = (p0.x + p1.x + p2.x) / 3.0;
+                let cy = (p0.y + p1.y + p2.y) / 3.0;
+                painter.text(
+                    egui::pos2(cx, cy),
+                    egui::Align2::CENTER_CENTER,
+                    format!("face #{}", f / 3),
+                    egui::FontId::default(),
+                    accent,
+                );
+            }
+        }
+    }
+
     /// True when the active source is a built-in TPMS surface.
     fn tpms_active(&self) -> bool {
-        self.source.is_tpms()
+        self.tpms_family.is_some()
+    }
+
+    /// Internal name of the active surface (TPMS family if active, else the
+    /// primitive/custom name) — used for formula cards / cache keys.
+    fn active_name(&self) -> String {
+        self.tpms_family
+            .map(|f| f.name().to_string())
+            .unwrap_or_else(|| self.source.name().to_string())
     }
 
     /// 根据 cell 范围自动计算 blend 权重场的 Sigmoid 参数。
@@ -997,6 +1177,7 @@ impl App {
             let selected = self.source == surface;
             if ui.selectable_label(selected, surface.label()).clicked() {
                 self.source = surface.clone();
+                self.tpms_family = None;
                 self.needs_remesh = true;
             }
             if selected {
@@ -1027,30 +1208,40 @@ impl App {
         ui.add_space(10.0);
         // ── TPMS (dropdown) ───────────────────────────────
         ui.label("Triply Periodic Minimal Surfaces:");
-        let tpms_surfaces = SurfaceType::tpms_surfaces();
-        let current_idx = tpms_surfaces.iter()
-            .position(|s| *s == self.source)
+        // ── TPMS (dropdown) ───────────────────────────────
+        ui.label("Triply Periodic Minimal Surfaces:");
+        let tpms_families = TpmsFamily::all();
+        let current_idx = tpms_families
+            .iter()
+            .position(|f| Some(*f) == self.tpms_family)
             .unwrap_or(0);
         let mut tpms_idx = current_idx;
         egui::ComboBox::from_id_salt("tpms_combo")
             .width(200.0)
-            .selected_text(tpms_surfaces[current_idx].label())
+            .selected_text(tpms_families[current_idx].label())
             .show_ui(ui, |ui| {
-                for (i, surface) in tpms_surfaces.iter().enumerate() {
-                    ui.selectable_value(&mut tpms_idx, i, surface.label());
+                for (i, family) in tpms_families.iter().enumerate() {
+                    ui.selectable_value(&mut tpms_idx, i, family.label());
                 }
             });
         if tpms_idx != current_idx {
-            let new_surface = tpms_surfaces[tpms_idx].clone();
-            self.source = new_surface.clone();
-            let params = new_surface.default_params();
-            self.tpms_period = params.tpms_period;
-            self.tpms_cells = params.tpms_cells;
+            let family = tpms_families[tpms_idx];
+            self.tpms_family = Some(family);
+            // Adopt this family's default period/cell parameters (matches the
+            // prior behaviour of `default_params`).  Volume fraction,
+            // thickness, and blend settings are preserved.
+            let d = TpmsSurface::new(family);
+            self.tpms_period = d.period;
+            self.tpms_cells = d.cells;
+            self.tpms_cell_size = d.cell_size;
+            self.tpms_amplitude = d.amplitude;
+            self.tpms_offset = d.offset;
             self.needs_remesh = true;
         }
 
         // ── Formula card ─────────────────────────────────
         if self.tpms_active() {
+            let name = self.active_name();
             ui.add_space(4.0);
             let frame_fill = ui.visuals().widgets.noninteractive.bg_fill;
             egui::Frame::new()
@@ -1058,7 +1249,7 @@ impl App {
                 .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
-                    if let Some(tex) = self.formula_cache.get(egui_ctx, self.source.name()) {
+                    if let Some(tex) = self.formula_cache.get(egui_ctx, &name) {
                         let size = tex.size_vec2();
                         let max_w = ui.available_width().max(240.0);
                         let scale = (max_w / size.x).min(1.0);
@@ -1067,7 +1258,7 @@ impl App {
                             egui::vec2(size.x * scale, size.y * scale),
                         ));
                     } else {
-                        ui.code(tpms_formula(self.source.name()));
+                        ui.code(tpms_formula(&name));
                     }
                 });
         }
@@ -1081,10 +1272,12 @@ impl App {
                 .code_editor());
             if resp.lost_focus() && resp.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.source = SurfaceType::Custom(self.custom_expr.clone());
+                self.tpms_family = None;
                 self.needs_remesh = true;
             }
             if ui.button("Apply").clicked() {
                 self.source = SurfaceType::Custom(self.custom_expr.clone());
+                self.tpms_family = None;
                 self.needs_remesh = true;
             }
         });
@@ -1097,12 +1290,14 @@ impl App {
             if ui.link("sphere").clicked() {
                 self.custom_expr = "x*x + y*y + z*z - 0.64".into();
                 self.source = SurfaceType::Custom(self.custom_expr.clone());
+                self.tpms_family = None;
                 self.needs_remesh = true;
             }
             ui.label(egui::RichText::new("|").small());
             if ui.link("gyroid").clicked() {
                 self.custom_expr = "sin(4*x)*cos(4*y) + sin(4*y)*cos(4*z) + sin(4*z)*cos(4*x)".into();
                 self.source = SurfaceType::Custom(self.custom_expr.clone());
+                self.tpms_family = None;
                 self.needs_remesh = true;
             }
         });
@@ -1286,39 +1481,40 @@ impl App {
                     };
                     self.needs_remesh = true;
                 }
-                if let Some(ref mut sec) = self.blend_secondary {
-                    // ── Show both formulas ──
-                    let frame_fill = ui.visuals().widgets.noninteractive.bg_fill;
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("f1 (Primary):").strong());
-                    egui::Frame::new()
-                        .fill(frame_fill)
-                        .corner_radius(egui::CornerRadius::same(4))
-                        .inner_margin(egui::Margin::same(6))
-                        .show(ui, |ui| {
-                            if let Some(tex) = self.formula_cache.get(egui_ctx, self.source.name()) {
-                                let size = tex.size_vec2();
-                                let max_w = ui.available_width().max(200.0);
-                                let scale = (max_w / size.x).min(0.8);
-                                ui.image(egui::load::SizedTexture::new(
-                                    tex.id(),
-                                    egui::vec2(size.x * scale, size.y * scale),
-                                ));
-                            } else {
-                                ui.code(tpms_formula(self.source.name()));
-                            }
-                        });
+                    let active = self.active_name();
+                    if let Some(ref mut sec) = self.blend_secondary {
+                        // ── Show both formulas ──
+                        let frame_fill = ui.visuals().widgets.noninteractive.bg_fill;
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("f1 (Primary):").strong());
+                        egui::Frame::new()
+                            .fill(frame_fill)
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .inner_margin(egui::Margin::same(6))
+                            .show(ui, |ui| {
+                                if let Some(tex) = self.formula_cache.get(egui_ctx, &active) {
+                                    let size = tex.size_vec2();
+                                    let max_w = ui.available_width().max(200.0);
+                                    let scale = (max_w / size.x).min(0.8);
+                                    ui.image(egui::load::SizedTexture::new(
+                                        tex.id(),
+                                        egui::vec2(size.x * scale, size.y * scale),
+                                    ));
+                                } else {
+                                    ui.code(tpms_formula(&active));
+                                }
+                            });
 
                     ui.add_space(4.0);
                     let current = sec.clone();
                     ui.label(egui::RichText::new("f2 (Secondary):").strong());
                     egui::ComboBox::from_id_salt("blend_secondary_combo")
                         .selected_text(
-                            SurfaceType::tpms_surfaces().iter()
+                            TpmsFamily::all().iter()
                                 .find(|s| s.name() == current.as_str())
                                 .map(|s| s.label()).unwrap_or("Gyroid"))
                         .show_ui(ui, |ui| {
-                            for s in SurfaceType::tpms_surfaces() {
+                            for s in TpmsFamily::all() {
                                 if ui.selectable_label(current == s.name(), s.label()).clicked() {
                                     *sec = s.name().to_string();
                                     self.needs_remesh = true;
@@ -1604,6 +1800,17 @@ impl App {
 
         // ── Points ──────────────────────────────────────────
         ui.checkbox(&mut self.render_state.vertex_opts.enabled, "Show points");
+        if self.dense_mesh {
+            ui.label(
+                egui::RichText::new(
+                    "Mesh is very dense — point/edge overlays are auto-capped by the \
+                     renderer to avoid GPU stalls. Lower Grid resolution / Octree depth \
+                     to re-enable them.",
+                )
+                .size(11.0)
+                .color(egui::Color32::GOLD),
+            );
+        }
         if self.render_state.vertex_opts.enabled {
             ui.indent("point_opts", |ui| {
                 ui.horizontal(|ui| {
@@ -1672,22 +1879,11 @@ fn main() {
         // 在单位立方体内均匀采样，统计各 TPMS 函数的 [min, max] 值域，
         // 用于判断 UI 中 C value slider 范围是否合理。
         eprintln!("\n[tpms range] sampling value ranges (period=4.0, N=64³):");
-        for surface_type in SurfaceType::tpms_surfaces() {
-            let name = surface_type.name();
-            let p2 = TreeParams {
-                name, sphere_radius: 0.8,
-                torus_major_r: 0.6, torus_minor_r: 0.2,
-                tpms_period: 4.0, tpms_cells: [1, 1, 1],
-                tpms_cell_size: [1.0, 1.0, 1.0],
-                tpms_amplitude: [1.0, 1.0, 1.0],
-                tpms_offset: 0.0,
-                rotation_axis: [0.0, 0.0, 1.0],
-                rotation_angle: 0.0,
-                blend_secondary: None,
-                blend_weight_field: GradientField::default(),
-                offset_field: GradientField::default(),
-            };
-            let tree2 = build_tree(&p2);
+        for family in TpmsFamily::all() {
+            let name = family.name();
+            let mut surf = TpmsSurface::new(family);
+            surf.period = 4.0;
+            let tree2 = surf.build_tree([0.0, 0.0, 1.0], 0.0);
             use fidget_core::shape::Shape;
             use fidget_jit::JitFunction;
             let shape2 = Shape::<JitFunction>::from(tree2);
@@ -1719,20 +1915,11 @@ fn main() {
 
         // Validate the volume-fraction → C solver: varying φ must shift
         // the zero-set, producing a different mesh.
-        let p = TreeParams { name: "gyroid", sphere_radius: 0.8,
-            torus_major_r: 0.6, torus_minor_r: 0.2,
-            tpms_period: 4.0, tpms_cells: [1, 1, 1],
-            tpms_cell_size: [1.0, 1.0, 1.0],
-            tpms_amplitude: [1.0, 1.0, 1.0],
-            tpms_offset: 0.0,
-            rotation_axis: [0.0, 0.0, 1.0],
-            rotation_angle: 0.0,
-            blend_secondary: None,
-            blend_weight_field: GradientField::default(),
-            offset_field: GradientField::default() };
-        let tree = build_tree(&p);
+        let mut surf = TpmsSurface::new(TpmsFamily::Gyroid);
+        surf.period = 4.0;
+        let tree = surf.build_tree([0.0, 0.0, 1.0], 0.0);
         for phi in [0.3_f32, 0.5, 0.7] {
-            let c_val = solve_c_for_vol_frac(&tree, phi);
+            let c_val = engvis_tpms::solve_c_for_vol_frac(&tree, phi);
             let field = tree.clone() - c_val;
             let (mesh, _stats) = build_mesh(
                 field, "iso-test",
@@ -1778,7 +1965,7 @@ fn main() {
 
         // Shell mesh topology test: MC33 TPMS shell + box CSG cap.
         eprintln!("\n[shell selftest] building shell mesh (gyroid, res=96)...");
-        let shell_half_t = 0.5 * 0.1 * p.tpms_period.max(1.0);
+        let shell_half_t = 0.5 * 0.1 * surf.period.max(1.0);
         let t0 = std::time::Instant::now();
         let (sh_mesh, sh_stats) = build_shell_mesh(
             tree.clone(), shell_half_t, "shell-test", 96,
@@ -1795,7 +1982,8 @@ fn main() {
     }
 
     engvis_renderer::run(App {
-        source: SurfaceType::Gyroid,
+        source: SurfaceType::Sphere,
+        tpms_family: Some(TpmsFamily::Gyroid),
         custom_expr: "sin(4*x)*cos(4*y) + sin(4*y)*cos(4*z) + sin(4*z)*cos(4*x)".to_string(),
         custom_error: None,
         clip_to_unit_ball: false,
@@ -1851,9 +2039,16 @@ fn main() {
         camera_fitted: false,
         last_topology: None,
         last_build_ok: true,
+        selection: Selection::None,
+        pick_mesh: None,
+        pick_edges: None,
+        last_cursor: [0.0, 0.0],
+        press_cursor: None,
+        pending_pick: false,
         formula_cache: formula_cache::FormulaCache::new(),
         mesh_build_result: None,
         build_status: "ready".into(),
+        dense_mesh: false,
         build_stats: String::new(),
     });
 }
