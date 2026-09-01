@@ -1107,7 +1107,7 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
 name = "engvis"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "engvis-core",
  "engvis-mesher",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "engvis-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "earcutr",
  "egui",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "engvis-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytemuck",
  "glam 0.30.10",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "engvis-mesher"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "engvis-core",
  "engvis-surface",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "engvis-renderer"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytemuck",
  "egui",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "engvis-surface"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "fidget-core",
  "fidget-rhai",
@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "engvis-tpms"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "fidget-core",
  "fidget-jit",

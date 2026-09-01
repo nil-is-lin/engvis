@@ -10,8 +10,8 @@ keywords = ["visualization", "mesh", "tpms", "wgpu", "cad"]
 categories = ["graphics", "rendering"]
 
 [dependencies]
-engvis-core = { path = "../engvis-core", version = "0.1.5" }
-engvis-surface = { path = "../engvis-surface", version = "0.1.5" }
-engvis-tpms = { path = "../engvis-tpms", version = "0.1.5" }
-engvis-mesher = { path = "../engvis-mesher", version = "0.1.5" }
-engvis-renderer = { path = "../engvis-renderer", version = "0.1.5" }
+engvis-core = { path = "../engvis-core", version = "0.1.6" }
+engvis-surface = { path = "../engvis-surface", version = "0.1.6" }
+engvis-tpms = { path = "../engvis-tpms", version = "0.1.6" }
+engvis-mesher = { path = "../engvis-mesher", version = "0.1.6" }
+engvis-renderer = { path = "../engvis-renderer", version = "0.1.6" }

@@ -11,9 +11,9 @@ homepage = "https://github.com/nil-is-lin/engvis"
 repository = "https://github.com/nil-is-lin/engvis"
 
 [dependencies]
-engvis-surface = { path = "../engvis-surface", version = "0.1.5" }
-engvis-tpms = { path = "../engvis-tpms", version = "0.1.5" }
-engvis-core = { path = "../engvis-core", version = "0.1.5" }
+engvis-surface = { path = "../engvis-surface", version = "0.1.6" }
+engvis-tpms = { path = "../engvis-tpms", version = "0.1.6" }
+engvis-core = { path = "../engvis-core", version = "0.1.6" }
 fidget-core.workspace = true
 fidget-jit.workspace = true
 fidget-mesh.workspace = true
