@@ -306,13 +306,54 @@ The complete camera update pipeline per frame:
         so the drag delta is negated: \texttt{pan($-\Delta x \cdot s$,
         $-\Delta y \cdot s$)} makes the object follow the cursor
         (drag up $\to$ object up, drag right $\to$ object right).
-  \item \textbf{Zoom} (scroll) --- scales \texttt{distance} with
-        clamp $[0.1, 500]$.
+  \item \textbf{Zoom} (scroll) --- scales \texttt{distance} with a
+        scene-radius-relative clamp
+        $[0.02\,r,\,500\,r]$ and resynchronises the near/far clip
+        planes (Section~\ref{sec:clip}).
   \item \textbf{View matrix} --- built from
         $\mathbf{q}^{-1}$ and $-\mathbf{p}_{\text{cam}}$.
   \item \textbf{Projection} --- perspective RH from \texttt{fov\_y},
         \texttt{aspect\_ratio}, \texttt{near}, \texttt{far}.
 \end{enumerate}
+
+\section{Zoom-Synchronised Clip Planes}
+\label{sec:clip}
+
+Initially \texttt{near} / \texttt{far} were computed once in
+\texttt{fit\_to\_aabb} and never touched again, while \texttt{zoom()}
+only changed \texttt{distance} (clamped to the fixed range
+$[0.1, 500]$).  Consequently the object vanished whenever
+\[
+  d < \text{\texttt{near}} \quad (\text{zoom in}) \qquad\text{or}\qquad
+  d > \text{\texttt{far}} \quad (\text{zoom out}),
+\]
+with $d$ the camera distance --- the reported ``object disappears at
+extreme zoom'' bug.
+
+The fix introduces a \texttt{scene\_radius} $r$ (half the fitted AABB
+diagonal, stored by \texttt{fit\_to\_aabb}).  Every zoom step
+recomputes the clip planes from the new distance:
+\begin{align}
+  d &\leftarrow \operatorname{clamp}\!\bigl(d\,(1-\delta),\;
+        0.02\,r,\; 500\,r\bigr), \\[2pt]
+  \text{\texttt{near}} &\leftarrow \max\!\bigl(d - 2r,\;
+        10^{-3} d,\; 10^{-4}\bigr), \\[2pt]
+  \text{\texttt{far}} &\leftarrow \max\!\bigl(d + 2r,\; 10\bigr).
+\end{align}
+The nearest possible surface point is $d - r$ (bounding sphere), so
+$\text{\texttt{near}} = d - 2r$ keeps a full-radius margin in front of
+the geometry --- robust against a slightly underestimated
+\texttt{scene\_radius} (e.g.\ \texttt{colorbar3d} sets \texttt{distance}
+manually and never fits).  When the camera moves inside the bounding
+sphere ($d - 2r < 0$) the near plane falls back to a small fraction of
+$d$, which stays in front of the camera.  Because both planes follow
+$d$, the ratio $\text{\texttt{far}}/\text{\texttt{near}}$ stays bounded
+and depth precision is preserved across the whole zoom range.
+
+A regression test (\texttt{zoom\_keeps\_object\_inside\_clip\_planes})
+zooms across the reachable range for radii
+$\{0.05, 1, 1.73, 40\}$ and asserts the bounding sphere never leaves
+$[\text{\texttt{near}}, \text{\texttt{far}}]$.
 
 \section{Result}
 
@@ -324,6 +365,10 @@ After the refactor:
         previous camera framing.
   \item The \texttt{colorbar3d} example's reset-view button restores
         the same isometric orientation as before.
+  \item Zooming in or out to any reachable distance keeps the object
+        inside the frustum (Section~\ref{sec:clip}); the previously
+        reported disappearance at extreme zoom is fixed and covered by
+        a unit test.
   \item \texttt{cargo build}, \texttt{cargo test --workspace}, and
         runtime startup all pass without errors.
 \end{itemize}

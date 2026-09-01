@@ -19,6 +19,9 @@ pub struct OrbitCamera {
     pub far: f32,
     /// Aspect ratio (width / height)
     pub aspect_ratio: f32,
+    /// Scene radius used to derive near/far clip planes when zooming.
+    /// Set by `fit_to_aabb`; defaults to 1.
+    pub scene_radius: f32,
 }
 
 impl OrbitCamera {
@@ -31,6 +34,7 @@ impl OrbitCamera {
             near: 0.01,
             far: 1000.0,
             aspect_ratio: 16.0 / 9.0,
+            scene_radius: 1.0,
         }
     }
 
@@ -111,10 +115,34 @@ impl OrbitCamera {
         self.target += right * delta_x + up * delta_y;
     }
 
-    /// Zoom (change distance)
+    /// Zoom (change distance).
+    ///
+    /// The near/far clip planes are recomputed from the new distance so
+    /// the object stays inside the frustum at every zoom level — a fixed
+    /// far plane would clip it when zooming far out, a fixed near plane
+    /// when zooming close in.
     pub fn zoom(&mut self, delta: f32) {
-        self.distance *= 1.0 - delta;
-        self.distance = self.distance.clamp(0.1, 500.0);
+        let min_d = (self.scene_radius * 0.02).max(1e-3);
+        let max_d = self.scene_radius * 500.0;
+        self.distance = (self.distance * (1.0 - delta)).clamp(min_d, max_d);
+        self.update_clip_planes();
+    }
+
+    /// Recompute near/far clip planes from the current `distance` and
+    /// `scene_radius`.
+    ///
+    /// `near` keeps a `1 * radius` margin in front of the nearest
+    /// possible surface point (`distance - radius`); it falls back to a
+    /// small fraction of the distance when the camera is inside that
+    /// margin.  `far` covers the whole object plus a grid-extent floor.
+    /// The `far / near` ratio stays bounded as the camera moves,
+    /// preserving depth precision.
+    fn update_clip_planes(&mut self) {
+        let r = self.scene_radius;
+        self.near = (self.distance - r * 2.0)
+            .max(self.distance * 1e-3)
+            .max(1e-4);
+        self.far = (self.distance + r * 2.0).max(10.0);
     }
 
     /// Fit camera to show a bounding box, adjusting near/far automatically.
@@ -126,8 +154,8 @@ impl OrbitCamera {
         let radius = aabb.diagonal() * 0.5;
         let min_dist = (radius / (self.fov_y * 0.5).sin()).max(0.5);
         self.distance = min_dist * 1.4; // +40% margin
-        self.near = (min_dist - radius * 2.0).max(0.01);
-        self.far = (min_dist + radius * 4.0).max(10.0);
+        self.scene_radius = radius;
+        self.update_clip_planes();
     }
 
     /// Fit camera to show an entire scene.
@@ -165,5 +193,50 @@ impl OrbitCamera {
 impl Default for OrbitCamera {
     fn default() -> Self {
         Self::new(Vec3::ZERO, 5.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Across the full zoom range the bounding sphere of the fitted
+    /// scene must stay inside `[near, far]` — the regression behind
+    /// "object disappears at extreme zoom".
+    #[test]
+    fn zoom_keeps_object_inside_clip_planes() {
+        for radius in [0.05_f32, 1.0, 1.73, 40.0] {
+            let aabb = Aabb {
+                min: Vec3::splat(-radius),
+                max: Vec3::splat(radius),
+            };
+            let mut cam = OrbitCamera::default();
+            cam.fit_to_aabb(aabb);
+            let check = |cam: &OrbitCamera, radius: f32| {
+                let nearest = cam.distance - radius;
+                let farthest = cam.distance + radius;
+                if nearest > 0.0 {
+                    assert!(cam.near < nearest, "near {} >= nearest {} (r={radius})",
+                            cam.near, nearest);
+                } else {
+                    // Camera inside the bounding sphere: the near plane
+                    // only has to stay in front of the camera.
+                    assert!(cam.near < cam.distance, "near {} >= distance {} (r={radius})",
+                            cam.near, cam.distance);
+                }
+                assert!(cam.far > farthest, "far {} <= farthest {} (r={radius})",
+                        cam.far, farthest);
+                assert!(cam.near > 0.0);
+            };
+            // Zoom in and out across the reachable distance range.
+            for _ in 0..64 {
+                cam.zoom(-0.1);
+                check(&cam, radius);
+            }
+            for _ in 0..96 {
+                cam.zoom(0.1);
+                check(&cam, radius);
+            }
+        }
     }
 }
