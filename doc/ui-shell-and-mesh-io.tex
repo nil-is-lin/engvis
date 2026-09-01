@@ -372,6 +372,85 @@ remesh.}
 \end{figure}
 
 % =====================================================================
+\section{CJK Font Fallback in the egui Backend}
+
+The UI text is drawn by \texttt{egui}, whose built-in font
+(\texttt{Ubuntu-Light}) contains no CJK glyphs; every Chinese
+character would render as an empty box (``\,\rule{0.8ex}{0.8ex}\,'').
+The fix lives in
+\texttt{crates/engvis-renderer/src/egui\_integration.rs} and runs
+inside \lstinline|EguiContext::new|, i.e.\ once per application
+start, before the first frame is laid out.
+
+\subsection{Fallback strategy}
+
+Rather than embedding a large CJK font into the binary, the renderer
+scans a prioritised list of system font paths (Table~\ref{tab:cjk})
+and installs the first existing file as an \emph{additional} font in
+both egui font families (\texttt{Proportional} and
+\texttt{Monospace}).  egui resolves each glyph against the family
+list in order, so Latin text keeps the built-in font while CJK code
+points fall through to the system font:
+\begin{equation}
+  g \;\longmapsto\;
+  \begin{cases}
+    \text{built-in glyph},    & g \in \text{Latin / symbols}, \\[2pt]
+    \text{system CJK glyph},  & \text{otherwise}.
+  \end{cases}
+\end{equation}
+
+\begin{table}[h]
+\centering
+\caption{System CJK font candidates, in priority order.  For
+\texttt{.ttc} collections the first face (index 0) is used.}
+\label{tab:cjk}
+\begin{tabular}{lll}
+\toprule
+\textbf{Platform} & \textbf{Path} & \textbf{Face} \\ \midrule
+macOS   & \texttt{Hiragino Sans GB.ttc}      & Hiragino Sans GB W3 \\
+macOS   & \texttt{PingFang.ttc}              & PingFang \\
+macOS   & \texttt{STHeiti Medium.ttc}        & Heiti \\
+macOS   & \texttt{Supplemental/Arial Unicode.ttf} & Arial Unicode \\
+Windows & \texttt{C:\textbackslash Windows\textbackslash Fonts\textbackslash msyh.ttc} & Microsoft YaHei \\
+Linux   & \texttt{NotoSansCJK-Regular.ttc}   & Noto Sans CJK \\
+Linux   & \texttt{wqy-microhei.ttc}          & WenQuanYi Micro Hei \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    >={Stealth[length=2mm]},
+    every node/.style={font=\small},
+    box/.style={draw, rounded corners, minimum height=8mm,
+                minimum width=46mm, align=center, fill=blue!5},
+    dec/.style={draw, diamond, aspect=2.4, fill=yellow!15, align=center,
+                inner sep=0.6mm},
+]
+  \node[box] (new) {\lstinline|EguiContext::new|};
+  \node[dec, below=5mm of new] (found)
+        {first candidate font file present?};
+  \node[box, below=5mm of found, fill=green!12] (load)
+        {read file $\to$ \lstinline|FontData|\\(ttc index $=0$)};
+  \node[box, right=14mm of load, fill=red!10] (warn)
+        {eprintln warning\\UI text may show boxes};
+  \node[box, below=5mm of load] (push)
+        {append \texttt{cjk\_fallback} to\\ \texttt{Proportional} and \texttt{Monospace}};
+  \node[box, below=5mm of push] (setf) {\lstinline|context.set_fonts(fonts)|};
+  \draw[->] (new) -- (found);
+  \draw[->] (found) -- node[left, font=\scriptsize]{yes} (load);
+  \draw[->] (found.east) -| node[above, font=\scriptsize, pos=0.15]{no} (warn.north);
+  \draw[->] (load) -- (push);
+  \draw[->] (push) -- (setf);
+\end{tikzpicture}
+\caption{Font installation at egui context creation.  The fallback is
+appended \emph{last} in each family, so it only serves glyphs missing
+from the built-in fonts; missing fonts degrade to a console warning.}
+\label{fig:font}
+\end{figure}
+
+% =====================================================================
 \section{Build Notes}
 
 \paragraph{Dependency conflict.}
@@ -393,6 +472,9 @@ needed.
 cargo build -p engvis        # clean build, no warnings from this crate
 cargo run   -p engvis        # window opens; default surface gyroid-sphere
 \end{lstlisting}
+On startup \lstinline|EguiContext::new| installs the CJK fallback
+font (Figure~\ref{fig:font}); if no candidate file exists, a
+\texttt{warning: no CJK system font found} line is printed on stderr.
 Status-bar readouts are produced by
 \lstinline|compute_topology| immediately after each successful mesh
 build, ensuring the displayed $V,E,F,\chi$ correspond to exactly the

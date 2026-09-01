@@ -1,7 +1,56 @@
 use std::sync::Arc;
+use egui::{FontData, FontDefinitions, FontFamily};
 use egui_wgpu::{RendererOptions, ScreenDescriptor};
 use egui_winit::State;
 use winit::window::Window;
+
+/// 按优先级排列的系统中文字体候选路径（ttc 为字体集合，index 指定具体字面）。
+const CJK_FONT_CANDIDATES: &[(&str, u32)] = &[
+    ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),               // macOS 冬青黑体 W3
+    ("/System/Library/Fonts/PingFang.ttc", 0),                       // macOS 苹方
+    ("/System/Library/Fonts/STHeiti Medium.ttc", 0),                 // macOS 黑体-简
+    ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf", 0),     // macOS Arial Unicode
+    ("C:\\Windows\\Fonts\\msyh.ttc", 0),                             // Windows 微软雅黑
+    ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),   // Linux Noto CJK
+    ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),           // Linux 文泉驿微米黑
+];
+
+/// 为 egui 安装系统中文字体作为回退字体。
+///
+/// egui 内置的 Ubuntu-Light 不含 CJK 字形，中文会渲染为方框；将系统字体
+/// 追加到每个字体族的末尾，拉丁字符仍走内置字体，CJK 字符回退到系统字体。
+fn install_cjk_fallback_fonts(context: &egui::Context) {
+    let Some((path, index)) = CJK_FONT_CANDIDATES
+        .iter()
+        .find(|(path, _)| std::path::Path::new(path).is_file())
+    else {
+        eprintln!("warning: no CJK system font found, Chinese text may render as boxes");
+        return;
+    };
+
+    let Ok(data) = std::fs::read(path) else {
+        eprintln!("warning: failed to read CJK font {path}");
+        return;
+    };
+
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk_fallback".to_owned(),
+        Arc::new(FontData {
+            font: data.into(),
+            index: *index,
+            tweak: Default::default(),
+        }),
+    );
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("cjk_fallback".to_owned());
+    }
+    context.set_fonts(fonts);
+}
 
 pub struct EguiContext {
     pub context: egui::Context,
@@ -12,6 +61,7 @@ pub struct EguiContext {
 impl EguiContext {
     pub fn new(window: &Arc<Window>, device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let context = egui::Context::default();
+        install_cjk_fallback_fonts(&context);
         let state = State::new(
             context.clone(),
             egui::ViewportId::ROOT,
